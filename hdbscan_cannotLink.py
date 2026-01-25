@@ -421,6 +421,77 @@ def _component_has_conflict_with_root_numba(
 
 
 @numba.njit(cache=True)
+def _build_adjacency_list_numba(
+    u: np.ndarray,
+    v: np.ndarray,
+    w: np.ndarray,
+    n_points: int,
+) -> tuple:
+    """
+    Build CSR-style adjacency structure from edge arrays.
+
+    Each undirected edge (u[i], v[i], w[i]) is stored twice in the adjacency
+    structure: once for u[i] -> v[i] and once for v[i] -> u[i].
+
+    Args:
+        u (np.ndarray): Source nodes of edges (int32).
+        v (np.ndarray): Destination nodes of edges (int32).
+        w (np.ndarray): Weights of edges (float64).
+        n_points (int): Number of points/nodes in the graph.
+
+    Returns:
+        tuple:
+            adj_indptr (np.ndarray): CSR indptr array of shape (n_points + 1,).
+            adj_neighbors (np.ndarray): Neighbor node IDs for each adjacency entry.
+            adj_weights (np.ndarray): Edge weights for each adjacency entry.
+            adj_edge_ids (np.ndarray): Original edge indices for each adjacency entry.
+    """
+    n_edges = u.shape[0]
+
+    # Pass 1: Count the degree of each node
+    degree = np.zeros(n_points, dtype=np.int64)
+    for i in range(n_edges):
+        degree[u[i]] += 1
+        degree[v[i]] += 1
+
+    # Build indptr from degrees
+    adj_indptr = np.empty(n_points + 1, dtype=np.int64)
+    adj_indptr[0] = 0
+    for i in range(n_points):
+        adj_indptr[i + 1] = adj_indptr[i] + degree[i]
+
+    total_entries = adj_indptr[n_points]
+    adj_neighbors = np.empty(total_entries, dtype=np.int32)
+    adj_weights = np.empty(total_entries, dtype=np.float64)
+    adj_edge_ids = np.empty(total_entries, dtype=np.int32)
+
+    # Pass 2: Fill the adjacency arrays
+    # Use a counter array to track current fill position for each node
+    fill_pos = np.zeros(n_points, dtype=np.int64)
+
+    for i in range(n_edges):
+        a = u[i]
+        b = v[i]
+        ww = w[i]
+
+        # Entry for a -> b
+        pos_a = adj_indptr[a] + fill_pos[a]
+        adj_neighbors[pos_a] = b
+        adj_weights[pos_a] = ww
+        adj_edge_ids[pos_a] = i
+        fill_pos[a] += 1
+
+        # Entry for b -> a
+        pos_b = adj_indptr[b] + fill_pos[b]
+        adj_neighbors[pos_b] = a
+        adj_weights[pos_b] = ww
+        adj_edge_ids[pos_b] = i
+        fill_pos[b] += 1
+
+    return adj_indptr, adj_neighbors, adj_weights, adj_edge_ids
+
+
+@numba.njit(cache=True)
 def _constrained_kruskal_mst_csr_strict_sorted_numba(
     u_sorted: np.ndarray,
     v_sorted: np.ndarray,
@@ -518,6 +589,208 @@ def _constrained_kruskal_mst_csr_strict_sorted_numba(
         n_added += 1
 
         if n_added == n_points - 1:
+            break
+
+    return mst_edges[:n_added]
+
+
+@numba.njit(cache=True)
+def _constrained_boruvka_mst_csr_strict_numba(
+    adj_indptr: np.ndarray,
+    adj_neighbors: np.ndarray,
+    adj_weights: np.ndarray,
+    adj_edge_ids: np.ndarray,
+    cannot_link_indptr: np.ndarray,
+    cannot_link_indices: np.ndarray,
+    n_points: int,
+    n_edges: int,
+) -> np.ndarray:
+    """
+    Strict constrained Borůvka MST algorithm (Numba).
+
+    This algorithm builds a minimum spanning tree (or forest) while respecting
+    cannot-link constraints. It uses a component-centric approach where each
+    round finds the cheapest valid outgoing edge for each component, then
+    merges components.
+
+    Args:
+        adj_indptr (np.ndarray): CSR indptr for adjacency list.
+        adj_neighbors (np.ndarray): Neighbor node IDs in adjacency list.
+        adj_weights (np.ndarray): Edge weights in adjacency list.
+        adj_edge_ids (np.ndarray): Original edge indices in adjacency list.
+        cannot_link_indptr (np.ndarray): CSR indptr for cannot-link constraints.
+        cannot_link_indices (np.ndarray): CSR indices for cannot-link constraints.
+        n_points (int): Number of points/nodes.
+        n_edges (int): Number of original edges.
+
+    Returns:
+        np.ndarray:
+            mst_edges of shape (<=N-1, 3), float64. Columns: [u, v, w]
+            This may be a forest if constraints prevent full connectivity.
+    """
+    # Initialize DSU arrays
+    parent = np.empty(n_points, dtype=np.int32)
+    size = np.empty(n_points, dtype=np.int32)
+
+    # Per-component membership as a linked list stored in arrays
+    head = np.empty(n_points, dtype=np.int32)
+    tail = np.empty(n_points, dtype=np.int32)
+    next_node = np.empty(n_points, dtype=np.int32)
+
+    for i in range(n_points):
+        parent[i] = i
+        size[i] = 1
+        head[i] = i
+        tail[i] = i
+        next_node[i] = -1
+
+    # Track infeasible edges (constraint-violating edges never retry)
+    infeasible = np.zeros(n_edges, dtype=np.bool_)
+
+    # Per-component cheapest edge info (indexed by root)
+    cheapest_edge_id = np.empty(n_points, dtype=np.int32)
+    cheapest_weight = np.empty(n_points, dtype=np.float64)
+    cheapest_target = np.empty(n_points, dtype=np.int32)
+    cheapest_source = np.empty(n_points, dtype=np.int32)
+
+    mst_edges = np.empty((n_points - 1, 3), dtype=np.float64)
+    n_added = 0
+
+    while True:
+        # Reset cheapest edge info for all components
+        for i in range(n_points):
+            cheapest_edge_id[i] = -1
+            cheapest_weight[i] = np.inf
+            cheapest_target[i] = -1
+            cheapest_source[i] = -1
+
+        # Phase 1: Find cheapest valid outgoing edge per component
+        for i in range(n_points):
+            my_root = _dsu_find_numba(parent, i)
+
+            # Scan all neighbors of node i
+            start = adj_indptr[i]
+            end = adj_indptr[i + 1]
+            for k in range(start, end):
+                edge_id = adj_edge_ids[k]
+
+                # Skip edges marked infeasible
+                if infeasible[edge_id]:
+                    continue
+
+                j = adj_neighbors[k]
+                neighbor_root = _dsu_find_numba(parent, j)
+
+                # Skip same-component edges
+                if my_root == neighbor_root:
+                    continue
+
+                # Check cannot-link constraint between components
+                # Determine small/large for constraint check
+                if size[my_root] < size[neighbor_root]:
+                    root_small = my_root
+                    root_large = neighbor_root
+                else:
+                    root_small = neighbor_root
+                    root_large = my_root
+
+                if _component_has_conflict_with_root_numba(
+                    root_small,
+                    root_large,
+                    parent,
+                    head,
+                    next_node,
+                    cannot_link_indptr,
+                    cannot_link_indices,
+                ):
+                    # Mark as infeasible so we never check again
+                    infeasible[edge_id] = True
+                    continue
+
+                # Valid edge - check if it's the cheapest for my_root
+                ww = adj_weights[k]
+                if ww < cheapest_weight[my_root] or (
+                    ww == cheapest_weight[my_root]
+                    and edge_id < cheapest_edge_id[my_root]
+                ):
+                    cheapest_weight[my_root] = ww
+                    cheapest_edge_id[my_root] = edge_id
+                    cheapest_target[my_root] = neighbor_root
+                    cheapest_source[my_root] = i
+
+        # Phase 2: Merge components using cheapest edges
+        n_merges = 0
+        for r in range(n_points):
+            # Only process roots
+            if parent[r] != r:
+                continue
+
+            if cheapest_edge_id[r] == -1:
+                continue
+
+            # Find current root of target (may have changed in this phase)
+            target_root = _dsu_find_numba(parent, cheapest_target[r])
+
+            # Skip if already merged
+            if r == target_root:
+                continue
+
+            # Re-check constraint: target may have merged with another component
+            # that creates a new conflict
+            if size[r] < size[target_root]:
+                root_small = r
+                root_large = target_root
+            else:
+                root_small = target_root
+                root_large = r
+
+            if _component_has_conflict_with_root_numba(
+                root_small,
+                root_large,
+                parent,
+                head,
+                next_node,
+                cannot_link_indptr,
+                cannot_link_indices,
+            ):
+                # Skip this merge, but don't mark edge as permanently infeasible
+                # The edge might become valid next round with different component configurations
+                continue
+
+            # Lower-root-wins tie-breaking
+            winner = min(r, target_root)
+            loser = max(r, target_root)
+
+            # Union: attach loser -> winner
+            parent[loser] = winner
+            size[winner] = size[winner] + size[loser]
+
+            # Concatenate member lists: winner_tail.next = loser_head
+            next_node[tail[winner]] = head[loser]
+            tail[winner] = tail[loser]
+
+            # Emit MST edge
+            src = cheapest_source[r]
+            edge_id = cheapest_edge_id[r]
+            # Find the actual edge endpoints from adjacency
+            # We need to get the neighbor from the adjacency entry
+            tgt = -1
+            for k in range(adj_indptr[src], adj_indptr[src + 1]):
+                if adj_edge_ids[k] == edge_id:
+                    tgt = adj_neighbors[k]
+                    break
+
+            if tgt != -1:
+                mst_edges[n_added, 0] = float(src)
+                mst_edges[n_added, 1] = float(tgt)
+                mst_edges[n_added, 2] = cheapest_weight[r]
+                n_added += 1
+                n_merges += 1
+
+            if n_added == n_points - 1:
+                break
+
+        if n_merges == 0 or n_added == n_points - 1:
             break
 
     return mst_edges[:n_added]
@@ -806,18 +1079,19 @@ def _kruskal_mst_unconstrained(
     return mst_edges[:n_added]
 
 
-def _kruskal_mst_constrained_hard(
+def _mst_constrained_hard(
     *,
     n_points: int,
     u: np.ndarray,
     v: np.ndarray,
     w: np.ndarray,
     merge_constraint: MergeConstraint,
+    mst_method: str = "boruvka",
 ) -> np.ndarray:
     """
-    Hard constrained Kruskal:
-        Skip edges whose merge would place any cannot-link pair in one component.
+    Hard constrained MST using either Borůvka or Kruskal algorithm.
 
+    Skip edges whose merge would place any cannot-link pair in one component.
     This returns a spanning forest if constraints prevent full connectivity.
 
     Args:
@@ -826,10 +1100,14 @@ def _kruskal_mst_constrained_hard(
         v (np.ndarray): Destination nodes of edges.
         w (np.ndarray): Weights of edges.
         merge_constraint (MergeConstraint): The merge constraint object.
+        mst_method (str): Algorithm to use. Either "boruvka" (default) or "kruskal".
 
     Returns:
         (np.ndarray):
             The constrained minimum spanning tree edges.
+
+    Raises:
+        ValueError: If merge_constraint lacks CSR payload arrays or mst_method is invalid.
     """
     if (
         merge_constraint.cannot_link_indptr is None
@@ -839,11 +1117,6 @@ def _kruskal_mst_constrained_hard(
             "strict=True requires merge_constraint built from a cannot-link matrix "
             "(must provide CSR payload arrays)."
         )
-
-    order = np.argsort(w, kind="mergesort")
-    u_sorted = np.asarray(u[order], dtype=np.int32)
-    v_sorted = np.asarray(v[order], dtype=np.int32)
-    w_sorted = np.asarray(w[order], dtype=np.float64)
 
     cannot_link_indptr = np.asarray(merge_constraint.cannot_link_indptr, dtype=np.int64)
     cannot_link_indices = np.asarray(
@@ -855,14 +1128,42 @@ def _kruskal_mst_constrained_hard(
             "merge_constraint.cannot_link_indptr must have shape (N+1,) for strict=True."
         )
 
-    mst_edges = _constrained_kruskal_mst_csr_strict_sorted_numba(
-        u_sorted,
-        v_sorted,
-        w_sorted,
-        cannot_link_indptr,
-        cannot_link_indices,
-        int(n_points),
-    )
+    if mst_method == "boruvka":
+        # Build adjacency list for Borůvka
+        u_arr = np.asarray(u, dtype=np.int32)
+        v_arr = np.asarray(v, dtype=np.int32)
+        w_arr = np.asarray(w, dtype=np.float64)
+
+        adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+            u_arr, v_arr, w_arr, int(n_points)
+        )
+
+        mst_edges = _constrained_boruvka_mst_csr_strict_numba(
+            adj_indptr,
+            adj_neighbors,
+            adj_weights,
+            adj_edge_ids,
+            cannot_link_indptr,
+            cannot_link_indices,
+            int(n_points),
+            int(u_arr.shape[0]),
+        )
+    elif mst_method == "kruskal":
+        order = np.argsort(w, kind="mergesort")
+        u_sorted = np.asarray(u[order], dtype=np.int32)
+        v_sorted = np.asarray(v[order], dtype=np.int32)
+        w_sorted = np.asarray(w[order], dtype=np.float64)
+
+        mst_edges = _constrained_kruskal_mst_csr_strict_sorted_numba(
+            u_sorted,
+            v_sorted,
+            w_sorted,
+            cannot_link_indptr,
+            cannot_link_indices,
+            int(n_points),
+        )
+    else:
+        raise ValueError(f"Invalid mst_method: {mst_method}. Must be 'boruvka' or 'kruskal'.")
 
     return mst_edges
 
@@ -1263,6 +1564,7 @@ def fast_hdbscan_precomputed_with_merge_constraint(
     cluster_selection_persistence: float = 0.0,
     sample_weights: Optional[np.ndarray] = None,
     return_trees: bool = False,
+    mst_method: str = "boruvka",
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Optional[object], Optional[np.ndarray]
 ]:
@@ -1298,6 +1600,8 @@ def fast_hdbscan_precomputed_with_merge_constraint(
             Weights for each sample.
         return_trees (bool):
             Whether to return the condensed and linkage trees.
+        mst_method (str):
+            Algorithm for constrained MST. Either "boruvka" (default) or "kruskal".
 
     Returns:
         (Tuple):
@@ -1326,12 +1630,13 @@ def fast_hdbscan_precomputed_with_merge_constraint(
     )
 
     if bool(strict):
-        mst_edges = _kruskal_mst_constrained_hard(
+        mst_edges = _mst_constrained_hard(
             n_points=n_points,
             u=u,
             v=v,
             w=w,
             merge_constraint=merge_constraint,
+            mst_method=mst_method,
         )
     else:
         if merge_constraint.pair_cannot_link is None:
@@ -1402,6 +1707,7 @@ def fast_hdbscan_precomputed_with_cannot_link(
     cluster_selection_persistence: float = 0.0,
     sample_weights: Optional[np.ndarray] = None,
     return_trees: bool = False,
+    mst_method: str = "boruvka",
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Optional[object], Optional[np.ndarray]
 ]:
@@ -1423,6 +1729,7 @@ def fast_hdbscan_precomputed_with_cannot_link(
         cluster_selection_persistence (float): Stability measure for selection.
         sample_weights (Optional[np.ndarray]): Weights for each sample.
         return_trees (bool): Whether to return trees.
+        mst_method (str): Algorithm for constrained MST. Either "boruvka" (default) or "kruskal".
 
     Returns:
         (Tuple):
@@ -1451,6 +1758,7 @@ def fast_hdbscan_precomputed_with_cannot_link(
         cluster_selection_persistence=float(cluster_selection_persistence),
         sample_weights=sample_weights,
         return_trees=bool(return_trees),
+        mst_method=str(mst_method),
     )
 
 
@@ -1868,6 +2176,377 @@ def test_find_violations_requires_iterable_pairs():
     assert did_raise
 
 
+# =============================================================================
+# BORŮVKA MST TESTS
+# =============================================================================
+
+
+def test_adjacency_list_construction_simple():
+    """Test adjacency list builder with a simple 4-node graph."""
+    # Graph: 0--1 (w=1), 1--2 (w=2), 2--3 (w=3), 0--2 (w=4)
+    u = np.array([0, 1, 2, 0], dtype=np.int32)
+    v = np.array([1, 2, 3, 2], dtype=np.int32)
+    w = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+    n_points = 4
+
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n_points
+    )
+
+    # Check indptr structure
+    assert adj_indptr.shape[0] == n_points + 1
+    assert adj_indptr[0] == 0
+
+    # Node 0: neighbors 1, 2 (edges 0, 3)
+    degree_0 = adj_indptr[1] - adj_indptr[0]
+    assert degree_0 == 2
+    neighbors_0 = set(adj_neighbors[adj_indptr[0] : adj_indptr[1]])
+    assert neighbors_0 == {1, 2}
+
+    # Node 1: neighbors 0, 2 (edges 0, 1)
+    degree_1 = adj_indptr[2] - adj_indptr[1]
+    assert degree_1 == 2
+    neighbors_1 = set(adj_neighbors[adj_indptr[1] : adj_indptr[2]])
+    assert neighbors_1 == {0, 2}
+
+    # Node 2: neighbors 1, 3, 0 (edges 1, 2, 3)
+    degree_2 = adj_indptr[3] - adj_indptr[2]
+    assert degree_2 == 3
+    neighbors_2 = set(adj_neighbors[adj_indptr[2] : adj_indptr[3]])
+    assert neighbors_2 == {0, 1, 3}
+
+    # Node 3: neighbor 2 (edge 2)
+    degree_3 = adj_indptr[4] - adj_indptr[3]
+    assert degree_3 == 1
+    neighbors_3 = set(adj_neighbors[adj_indptr[3] : adj_indptr[4]])
+    assert neighbors_3 == {2}
+
+    # Total entries = 2 * n_edges = 8
+    assert adj_neighbors.shape[0] == 8
+    assert adj_weights.shape[0] == 8
+    assert adj_edge_ids.shape[0] == 8
+
+
+def test_adjacency_list_isolated_node():
+    """Test adjacency list with an isolated node (no edges)."""
+    # Graph: 0--1 (w=1), node 2 isolated
+    u = np.array([0], dtype=np.int32)
+    v = np.array([1], dtype=np.int32)
+    w = np.array([1.0], dtype=np.float64)
+    n_points = 3
+
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n_points
+    )
+
+    # Node 2 should have empty adjacency
+    assert adj_indptr[2] == adj_indptr[3]  # No neighbors
+
+
+def test_boruvka_unconstrained_produces_valid_mst():
+    """Test Borůvka produces a valid MST without constraints."""
+    # Complete graph on 5 nodes with known MST
+    # Edges: 0-1(1), 0-2(5), 0-3(3), 0-4(4), 1-2(2), 1-3(6), 1-4(7), 2-3(4), 2-4(3), 3-4(2)
+    edges = [
+        (0, 1, 1.0),
+        (0, 2, 5.0),
+        (0, 3, 3.0),
+        (0, 4, 4.0),
+        (1, 2, 2.0),
+        (1, 3, 6.0),
+        (1, 4, 7.0),
+        (2, 3, 4.0),
+        (2, 4, 3.0),
+        (3, 4, 2.0),
+    ]
+    u = np.array([e[0] for e in edges], dtype=np.int32)
+    v = np.array([e[1] for e in edges], dtype=np.int32)
+    w = np.array([e[2] for e in edges], dtype=np.float64)
+    n_points = 5
+
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n_points
+    )
+
+    # Empty cannot-link (no constraints)
+    cannot_link_indptr = np.zeros(n_points + 1, dtype=np.int64)
+    cannot_link_indices = np.empty(0, dtype=np.int32)
+
+    mst_edges = _constrained_boruvka_mst_csr_strict_numba(
+        adj_indptr,
+        adj_neighbors,
+        adj_weights,
+        adj_edge_ids,
+        cannot_link_indptr,
+        cannot_link_indices,
+        n_points,
+        len(edges),
+    )
+
+    # MST should have N-1 = 4 edges
+    assert mst_edges.shape[0] == 4
+
+    # MST total weight should be 1+2+2+3 = 8 (0-1, 1-2, 3-4, 2-4)
+    total_weight = mst_edges[:, 2].sum()
+    assert total_weight == 8.0
+
+
+def test_boruvka_known_example_with_constraints():
+    """
+    Test Borůvka with known cannot-link constraint.
+    
+    5 nodes: 0,1,2,3,4
+    Cannot-link: (0,3)
+    Expected: forest with separate components (0 not merged with 3)
+    """
+    # Simple graph where natural MST would connect all
+    edges = [
+        (0, 1, 1.0),
+        (1, 2, 1.0),
+        (2, 3, 1.0),
+        (3, 4, 1.0),
+    ]
+    u = np.array([e[0] for e in edges], dtype=np.int32)
+    v = np.array([e[1] for e in edges], dtype=np.int32)
+    w = np.array([e[2] for e in edges], dtype=np.float64)
+    n_points = 5
+
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n_points
+    )
+
+    # Cannot-link: node 0 forbids node 3, node 3 forbids node 0
+    # CSR format: indptr tells where each node's forbidden list starts
+    # Node 0: [3], Node 1: [], Node 2: [], Node 3: [0], Node 4: []
+    cannot_link_indptr = np.array([0, 1, 1, 1, 2, 2], dtype=np.int64)
+    cannot_link_indices = np.array([3, 0], dtype=np.int32)
+
+    mst_edges = _constrained_boruvka_mst_csr_strict_numba(
+        adj_indptr,
+        adj_neighbors,
+        adj_weights,
+        adj_edge_ids,
+        cannot_link_indptr,
+        cannot_link_indices,
+        n_points,
+        len(edges),
+    )
+
+    # The constraint prevents 0 and 3 from being in the same component.
+    # With edges 0-1-2-3-4, edges 0-1 and 1-2 connect {0,1,2}, but edge 2-3 
+    # would merge {0,1,2} with {3}, violating cannot-link(0,3).
+    # So the forest should have fewer than 4 edges.
+    assert mst_edges.shape[0] < 4
+
+    # Build DSU from MST edges to verify components
+    parent = list(range(n_points))
+
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(mst_edges.shape[0]):
+        union(int(mst_edges[i, 0]), int(mst_edges[i, 1]))
+
+    # Verify 0 and 3 are in different components
+    assert find(0) != find(3)
+
+
+def test_boruvka_tie_breaking_deterministic():
+    """Test that Borůvka produces deterministic results with equal weights."""
+    # All edges have same weight - result should be consistent
+    edges = [(0, 1, 1.0), (1, 2, 1.0), (0, 2, 1.0)]
+    u = np.array([e[0] for e in edges], dtype=np.int32)
+    v = np.array([e[1] for e in edges], dtype=np.int32)
+    w = np.array([e[2] for e in edges], dtype=np.float64)
+    n_points = 3
+
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n_points
+    )
+
+    cannot_link_indptr = np.zeros(n_points + 1, dtype=np.int64)
+    cannot_link_indices = np.empty(0, dtype=np.int32)
+
+    # Run multiple times
+    results = []
+    for _ in range(3):
+        mst = _constrained_boruvka_mst_csr_strict_numba(
+            adj_indptr,
+            adj_neighbors,
+            adj_weights,
+            adj_edge_ids,
+            cannot_link_indptr,
+            cannot_link_indices,
+            n_points,
+            len(edges),
+        )
+        results.append(mst.copy())
+
+    # All results should be identical
+    for r in results[1:]:
+        assert np.allclose(results[0], r)
+
+
+def test_boruvka_single_node():
+    """Test Borůvka with a single node (0 edges)."""
+    u = np.empty(0, dtype=np.int32)
+    v = np.empty(0, dtype=np.int32)
+    w = np.empty(0, dtype=np.float64)
+    n_points = 1
+
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n_points
+    )
+
+    cannot_link_indptr = np.zeros(n_points + 1, dtype=np.int64)
+    cannot_link_indices = np.empty(0, dtype=np.int32)
+
+    mst_edges = _constrained_boruvka_mst_csr_strict_numba(
+        adj_indptr,
+        adj_neighbors,
+        adj_weights,
+        adj_edge_ids,
+        cannot_link_indptr,
+        cannot_link_indices,
+        n_points,
+        0,
+    )
+
+    assert mst_edges.shape[0] == 0
+
+
+def test_boruvka_fully_constrained_no_merges():
+    """Test Borůvka when all edges violate constraints (no merges possible)."""
+    # Triangle graph where all pairs are constrained
+    edges = [(0, 1, 1.0), (1, 2, 1.0), (0, 2, 1.0)]
+    u = np.array([e[0] for e in edges], dtype=np.int32)
+    v = np.array([e[1] for e in edges], dtype=np.int32)
+    w = np.array([e[2] for e in edges], dtype=np.float64)
+    n_points = 3
+
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n_points
+    )
+
+    # All pairs cannot link: 0<->1, 0<->2, 1<->2
+    # Node 0: [1, 2], Node 1: [0, 2], Node 2: [0, 1]
+    cannot_link_indptr = np.array([0, 2, 4, 6], dtype=np.int64)
+    cannot_link_indices = np.array([1, 2, 0, 2, 0, 1], dtype=np.int32)
+
+    mst_edges = _constrained_boruvka_mst_csr_strict_numba(
+        adj_indptr,
+        adj_neighbors,
+        adj_weights,
+        adj_edge_ids,
+        cannot_link_indptr,
+        cannot_link_indices,
+        n_points,
+        len(edges),
+    )
+
+    # No merges possible - all edges violate constraints
+    assert mst_edges.shape[0] == 0
+
+
+def test_boruvka_matches_kruskal_on_random_data():
+    """Test that Borůvka produces valid results similar to Kruskal on random data."""
+    rng = np.random.default_rng(42)
+
+    data_a = rng.normal(loc=-2.0, scale=0.5, size=(20, 2))
+    data_b = rng.normal(loc=2.0, scale=0.5, size=(20, 2))
+    data = np.vstack([data_a, data_b]).astype(np.float64)
+
+    distances = _dense_pairwise_distances_euclidean(data)
+
+    # Create some random cannot-link constraints
+    cannot_link = np.zeros((40, 40), dtype=np.float64)
+    for _ in range(5):
+        i, j = rng.integers(0, 40, size=2)
+        if i != j:
+            cannot_link[i, j] = 1.0
+            cannot_link[j, i] = 1.0
+
+    labels_boruvka, _ = fast_hdbscan_precomputed_with_cannot_link(
+        distances,
+        cannot_link,
+        strict=True,
+        min_cluster_size=5,
+        mst_method="boruvka",
+    )
+
+    labels_kruskal, _ = fast_hdbscan_precomputed_with_cannot_link(
+        distances,
+        cannot_link,
+        strict=True,
+        min_cluster_size=5,
+        mst_method="kruskal",
+    )
+
+    # Both should produce valid clusterings that respect constraints
+    # (violations would have been caught during MST construction)
+    # Check ARI is reasonably high (both find similar structure)
+    ari = adjusted_rand_score(labels_boruvka, labels_kruskal)
+    # Note: Borůvka and Kruskal may produce different MSTs with same constraints
+    # due to different edge selection strategies, but both should find valid solutions
+    assert ari >= 0.4  # Accept reasonably similar results
+
+
+def test_boruvka_empty_constraints_matches_unconstrained():
+    """Test that Borůvka with empty constraints matches unconstrained."""
+    rng = np.random.default_rng(123)
+    data = rng.normal(size=(30, 2)).astype(np.float64)
+    distances = _dense_pairwise_distances_euclidean(data)
+
+    # Empty cannot-link
+    cannot_link = np.zeros((30, 30), dtype=np.float64)
+
+    labels_constrained, _ = fast_hdbscan_precomputed_with_cannot_link(
+        distances,
+        cannot_link,
+        strict=True,
+        min_cluster_size=5,
+        mst_method="boruvka",
+    )
+
+    labels_unconstrained, _ = fast_hdbscan_precomputed(
+        distances,
+        min_cluster_size=5,
+    )
+
+    ari = adjusted_rand_score(labels_constrained, labels_unconstrained)
+    assert ari == 1.0
+
+
+def test_mst_method_invalid_raises():
+    """Test that invalid mst_method raises ValueError."""
+    rng = np.random.default_rng(0)
+    data = rng.normal(size=(10, 2)).astype(np.float64)
+    distances = _dense_pairwise_distances_euclidean(data)
+    cannot_link = np.zeros((10, 10), dtype=np.float64)
+
+    did_raise = False
+    try:
+        fast_hdbscan_precomputed_with_cannot_link(
+            distances,
+            cannot_link,
+            strict=True,
+            min_cluster_size=3,
+            mst_method="invalid",
+        )
+    except ValueError as e:
+        did_raise = True
+        assert "invalid" in str(e).lower()
+
+    assert did_raise
+
+
 if __name__ == "__main__":
     test_precomputed_matches_feature_space_on_dense_distances()
     test_empty_cannot_link_dense_is_noop_vs_unconstrained()
@@ -1880,4 +2559,17 @@ if __name__ == "__main__":
     test_precomputed_handles_sparse_distance_graph_with_isolated_node()
     test_posthoc_split_fixes_cross_component_violation()
     test_find_violations_requires_iterable_pairs()
+
+    # Borůvka MST tests
+    test_adjacency_list_construction_simple()
+    test_adjacency_list_isolated_node()
+    test_boruvka_unconstrained_produces_valid_mst()
+    test_boruvka_known_example_with_constraints()
+    test_boruvka_tie_breaking_deterministic()
+    test_boruvka_single_node()
+    test_boruvka_fully_constrained_no_merges()
+    test_boruvka_matches_kruskal_on_random_data()
+    test_boruvka_empty_constraints_matches_unconstrained()
+    test_mst_method_invalid_raises()
+
     print("All tests passed.")
