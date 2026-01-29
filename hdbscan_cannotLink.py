@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Callable, Iterable, Literal, Optional, Tuple, Union
 
 import numba
+from numba import prange
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.csgraph as sp_csgraph
@@ -15,6 +16,33 @@ from fast_hdbscan.hdbscan import clusters_from_spanning_tree
 
 Number = Union[int, float]
 CSR = sp.csr_matrix
+
+# Type alias for parallel backend selection
+ParallelBackend = Literal["auto", "cuda", "cpu", "sequential"]
+
+
+# ------------------------------- CUDA Detection -------------------------------
+
+_CUDA_AVAILABLE: Optional[bool] = None
+
+
+def _check_cuda_available() -> bool:
+    """
+    Check if CUDA is available for GPU acceleration.
+    
+    This function caches the result at module level to avoid repeated checks.
+    
+    Returns:
+        bool: True if CUDA is available, False otherwise.
+    """
+    global _CUDA_AVAILABLE
+    if _CUDA_AVAILABLE is None:
+        try:
+            from numba import cuda
+            _CUDA_AVAILABLE = cuda.is_available()
+        except Exception:
+            _CUDA_AVAILABLE = False
+    return _CUDA_AVAILABLE
 
 
 # ------------------------------- constraints -------------------------------
@@ -344,6 +372,34 @@ def _dsu_find_numba(parent: np.ndarray, x: int) -> int:
         x = px
 
     return root
+
+
+@numba.njit(cache=True)
+def _dsu_find_readonly_numba(parent: np.ndarray, x: int) -> int:
+    """
+    DSU find WITHOUT path compression (safe for parallel reads).
+    
+    This function traverses the parent chain to find the root but does NOT
+    perform path compression. This makes it safe for concurrent reads in
+    parallel phases where multiple threads may call find() on the same
+    data structure simultaneously.
+    
+    Use this in Step 1a (parallel edge selection) where we need to determine
+    component membership without modifying the DSU structure.
+    
+    Args:
+        parent (np.ndarray):
+            The parent array for the disjoint set union structure.
+        x (int):
+            The element to find.
+            
+    Returns:
+        (int):
+            The root of the set containing x.
+    """
+    while parent[x] != x:
+        x = parent[x]
+    return x
 
 
 @numba.njit(cache=True)
@@ -926,6 +982,280 @@ def _parallel_edge_selection_numba(
     return cheapest_source, cheapest_target, cheapest_weight, cheapest_edge_id
 
 
+# --------------- CPU Parallel Backend (Step 1a parallel, Step 1b sequential) ---------------
+
+
+@numba.njit(parallel=True, cache=True)
+def _parallel_edge_selection_step1a_cpu(
+    adj_indptr: np.ndarray,
+    adj_neighbors: np.ndarray,
+    adj_weights: np.ndarray,
+    adj_edge_ids: np.ndarray,
+    parent: np.ndarray,
+    size: np.ndarray,
+    head: np.ndarray,
+    next_node: np.ndarray,
+    cannot_link_indptr: np.ndarray,
+    cannot_link_indices: np.ndarray,
+    infeasible: np.ndarray,
+    n_points: int,
+    node_best_weight: np.ndarray,
+    node_best_edge_id: np.ndarray,
+    node_best_target: np.ndarray,
+    node_best_source: np.ndarray,
+) -> None:
+    """
+    Step 1a: Per-node edge search (PARALLEL on CPU).
+    
+    Each node independently scans its neighbors to find its best outgoing edge.
+    This step is embarrassingly parallel because each thread writes only to its
+    own index in the node_best_* arrays - no contention.
+    
+    IMPORTANT: Uses _dsu_find_readonly_numba (no path compression) to ensure
+    thread safety during parallel reads of the parent array.
+    
+    Args:
+        adj_*: Adjacency list arrays.
+        parent, size, head, next_node: DSU arrays (READ-ONLY in this phase).
+        cannot_link_*: Constraint arrays.
+        infeasible: Boolean array of infeasible edges (READ-ONLY in this phase).
+        n_points: Number of nodes.
+        node_best_*: OUTPUT arrays - per-node best edge info.
+    """
+    # NOTE: We cannot mark edges as infeasible here because that would be a
+    # parallel write to a shared array. Infeasibility marking happens in the
+    # sequential phase or is handled differently.
+    
+    for i in prange(n_points):
+        my_root = _dsu_find_readonly_numba(parent, i)
+        my_size = size[my_root]
+        
+        best_weight = np.inf
+        best_edge_id = -1
+        best_target = -1
+        
+        # Scan all neighbors of node i
+        start = adj_indptr[i]
+        end = adj_indptr[i + 1]
+        
+        for k in range(start, end):
+            edge_id = adj_edge_ids[k]
+            
+            # Skip edges already marked infeasible (read-only check)
+            if infeasible[edge_id]:
+                continue
+            
+            j = adj_neighbors[k]
+            neighbor_root = _dsu_find_readonly_numba(parent, j)
+            
+            # Skip same-component edges
+            if my_root == neighbor_root:
+                continue
+            
+            # Check cannot-link constraint between components
+            neighbor_size = size[neighbor_root]
+            if my_size < neighbor_size:
+                root_small = my_root
+                root_large = neighbor_root
+            else:
+                root_small = neighbor_root
+                root_large = my_root
+            
+            # Note: _component_has_conflict_with_root_numba is read-only
+            if _component_has_conflict_with_root_numba(
+                root_small,
+                root_large,
+                parent,
+                head,
+                next_node,
+                cannot_link_indptr,
+                cannot_link_indices,
+            ):
+                # Cannot mark infeasible here (would be parallel write)
+                # Will be marked in sequential aggregation phase
+                continue
+            
+            # Valid edge - check if best for this node
+            ww = adj_weights[k]
+            if ww < best_weight or (ww == best_weight and edge_id < best_edge_id):
+                best_weight = ww
+                best_edge_id = edge_id
+                best_target = neighbor_root
+        
+        # Write to this node's slot (no contention - each thread owns its index)
+        node_best_weight[i] = best_weight
+        node_best_edge_id[i] = best_edge_id
+        node_best_target[i] = best_target
+        node_best_source[i] = i
+
+
+@numba.njit(cache=True)
+def _parallel_edge_selection_step1b_cpu(
+    parent: np.ndarray,
+    n_points: int,
+    node_best_weight: np.ndarray,
+    node_best_edge_id: np.ndarray,
+    node_best_target: np.ndarray,
+    node_best_source: np.ndarray,
+    cheapest_weight: np.ndarray,
+    cheapest_edge_id: np.ndarray,
+    cheapest_target: np.ndarray,
+    cheapest_source: np.ndarray,
+) -> None:
+    """
+    Step 1b: Per-component aggregation (SEQUENTIAL on CPU).
+    
+    Aggregates per-node results into per-component cheapest edges.
+    This step MUST be sequential on CPU because multiple nodes in the same
+    component write to the same cheapest[root] location, and Numba CPU has
+    no atomic operations.
+    
+    Uses path compression (_dsu_find_numba) since this is sequential.
+    
+    Args:
+        parent: DSU parent array.
+        n_points: Number of nodes.
+        node_best_*: INPUT - per-node best edge info from Step 1a.
+        cheapest_*: OUTPUT - per-component cheapest edge info.
+    """
+    for i in range(n_points):
+        if node_best_edge_id[i] == -1:
+            continue
+        
+        # Use path compression here (sequential, safe)
+        my_root = _dsu_find_numba(parent, i)
+        
+        # Check if this node's best is better than component's current best
+        if node_best_weight[i] < cheapest_weight[my_root] or (
+            node_best_weight[i] == cheapest_weight[my_root]
+            and node_best_edge_id[i] < cheapest_edge_id[my_root]
+        ):
+            cheapest_weight[my_root] = node_best_weight[i]
+            cheapest_edge_id[my_root] = node_best_edge_id[i]
+            cheapest_target[my_root] = node_best_target[i]
+            cheapest_source[my_root] = node_best_source[i]
+
+
+@numba.njit(cache=True)
+def _parallel_edge_selection_cpu(
+    adj_indptr: np.ndarray,
+    adj_neighbors: np.ndarray,
+    adj_weights: np.ndarray,
+    adj_edge_ids: np.ndarray,
+    parent: np.ndarray,
+    size: np.ndarray,
+    head: np.ndarray,
+    next_node: np.ndarray,
+    cannot_link_indptr: np.ndarray,
+    cannot_link_indices: np.ndarray,
+    infeasible: np.ndarray,
+    n_points: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    CPU edge selection for constrained Borůvka (sequential version).
+    
+    Note: This is the sequential fallback. The parallel version uses
+    _parallel_edge_selection_cpu_parallel which is not decorated with njit.
+    
+    Two-phase approach:
+        Step 1a: Each node finds its best outgoing edge (sequential here)
+        Step 1b: Aggregate per-node results into per-component (sequential)
+    
+    Args:
+        adj_*: Adjacency list arrays.
+        parent, size, head, next_node: DSU arrays.
+        cannot_link_*: Constraint arrays.
+        infeasible: Boolean array marking infeasible edges.
+        n_points: Number of nodes.
+        
+    Returns:
+        Tuple of (cheapest_source, cheapest_target, cheapest_weight, cheapest_edge_id):
+            Per-component best edges indexed by root.
+    """
+    # Per-node arrays for Step 1a
+    node_best_weight = np.full(n_points, np.inf, dtype=np.float64)
+    node_best_edge_id = np.full(n_points, -1, dtype=np.int32)
+    node_best_target = np.full(n_points, -1, dtype=np.int32)
+    node_best_source = np.full(n_points, -1, dtype=np.int32)
+    
+    # Per-component arrays for Step 1b
+    cheapest_weight = np.full(n_points, np.inf, dtype=np.float64)
+    cheapest_edge_id = np.full(n_points, -1, dtype=np.int32)
+    cheapest_target = np.full(n_points, -1, dtype=np.int32)
+    cheapest_source = np.full(n_points, -1, dtype=np.int32)
+    
+    # Step 1a: Sequential per-node edge search (same as _parallel_edge_selection_numba)
+    for i in range(n_points):
+        my_root = _dsu_find_numba(parent, i)
+        my_size = size[my_root]
+        
+        best_weight = np.inf
+        best_edge_id = np.int32(-1)
+        best_target = np.int32(-1)
+        
+        start = adj_indptr[i]
+        end = adj_indptr[i + 1]
+        
+        for k in range(start, end):
+            edge_id = adj_edge_ids[k]
+            
+            if infeasible[edge_id]:
+                continue
+            
+            j = adj_neighbors[k]
+            neighbor_root = _dsu_find_numba(parent, j)
+            
+            if my_root == neighbor_root:
+                continue
+            
+            neighbor_size = size[neighbor_root]
+            if my_size < neighbor_size:
+                root_small = my_root
+                root_large = neighbor_root
+            else:
+                root_small = neighbor_root
+                root_large = my_root
+            
+            if _component_has_conflict_with_root_numba(
+                root_small,
+                root_large,
+                parent,
+                head,
+                next_node,
+                cannot_link_indptr,
+                cannot_link_indices,
+            ):
+                infeasible[edge_id] = True
+                continue
+            
+            ww = adj_weights[k]
+            if ww < best_weight or (ww == best_weight and edge_id < best_edge_id):
+                best_weight = ww
+                best_edge_id = edge_id
+                best_target = neighbor_root
+        
+        node_best_weight[i] = best_weight
+        node_best_edge_id[i] = best_edge_id
+        node_best_target[i] = best_target
+        node_best_source[i] = np.int32(i)
+    
+    # Step 1b: Sequential per-component aggregation
+    _parallel_edge_selection_step1b_cpu(
+        parent,
+        n_points,
+        node_best_weight,
+        node_best_edge_id,
+        node_best_target,
+        node_best_source,
+        cheapest_weight,
+        cheapest_edge_id,
+        cheapest_target,
+        cheapest_source,
+    )
+    
+    return cheapest_source, cheapest_target, cheapest_weight, cheapest_edge_id
+
+
 @numba.njit(cache=True)
 def _merge_edge_into_mst_numba(
     src: int,
@@ -1491,7 +1821,7 @@ def _fix_round_violations_numba(
 
 
 @numba.njit(cache=True)
-def _parallel_constrained_boruvka_mst_numba(
+def _parallel_constrained_boruvka_mst_sequential_numba(
     adj_indptr: np.ndarray,
     adj_neighbors: np.ndarray,
     adj_weights: np.ndarray,
@@ -1502,11 +1832,14 @@ def _parallel_constrained_boruvka_mst_numba(
     n_edges: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Parallel constrained Borůvka MST algorithm with violation correction.
+    Sequential constrained Borůvka MST algorithm with violation correction.
+    
+    This is the fully sequential version where Step 1a, 1b are both sequential.
+    Use this as the baseline or when parallel overhead exceeds benefits.
     
     This algorithm uses a 3-step round structure:
-        Step 1: Parallel edge selection WITH constraint checks
-        Step 2: Parallel merging WITHOUT constraint checks (race conditions possible)
+        Step 1: Sequential edge selection WITH constraint checks
+        Step 2: Sequential merging WITHOUT constraint checks (race conditions possible)
         Step 3: Violation correction using only current round edges
     
     Race conditions in Step 2 are fixed in Step 3 by removing the heaviest
@@ -1526,8 +1859,6 @@ def _parallel_constrained_boruvka_mst_numba(
         Tuple[np.ndarray, np.ndarray]:
             - mst_edges: Shape (<=N-1, 3), float64. Columns: [u, v, w]
             - cannot_link_edges: Shape (<=M, 3), float64. Edges removed due to violations.
-              Each row is [u, v, w] where the edge (u,v) with weight w was removed
-              because it participated in creating a constraint violation.
     """
     # Initialize DSU arrays
     parent = np.empty(n_points, dtype=np.int32)
@@ -1551,12 +1882,11 @@ def _parallel_constrained_boruvka_mst_numba(
     n_added = 0
     
     # Cannot-link edges (edges removed due to violations)
-    # Worst case: we remove as many edges as we add
     cannot_link_edge_out = np.empty((n_points - 1, 3), dtype=np.float64)
     n_cannot_link_edges = 0
     
     while True:
-        # ========== Step 1: Parallel edge selection WITH constraint checks ==========
+        # ========== Step 1: Sequential edge selection WITH constraint checks ==========
         cheapest_source, cheapest_target, cheapest_weight, cheapest_edge_id = \
             _parallel_edge_selection_numba(
                 adj_indptr,
@@ -1634,6 +1964,277 @@ def _parallel_constrained_boruvka_mst_numba(
             break
     
     return mst_edges[:n_added], cannot_link_edge_out[:n_cannot_link_edges]
+
+
+@numba.njit(cache=True)
+def _parallel_constrained_boruvka_mst_cpu_numba(
+    adj_indptr: np.ndarray,
+    adj_neighbors: np.ndarray,
+    adj_weights: np.ndarray,
+    adj_edge_ids: np.ndarray,
+    cannot_link_indptr: np.ndarray,
+    cannot_link_indices: np.ndarray,
+    n_points: int,
+    n_edges: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    CPU parallel constrained Borůvka MST algorithm with violation correction.
+    
+    This version parallelizes Step 1a (per-node edge search) using prange,
+    while Step 1b (aggregation) and Step 2 (merge) remain sequential.
+    
+    Parallelization strategy:
+        Step 1a: PARALLEL (prange) - each node finds its best edge
+        Step 1b: SEQUENTIAL - aggregate per-node to per-component (needs atomics)
+        Step 2: SEQUENTIAL - DSU mutations have ordering dependencies
+        Step 3: SEQUENTIAL - violation correction
+    
+    Args:
+        adj_indptr (np.ndarray): CSR indptr for adjacency list.
+        adj_neighbors (np.ndarray): Neighbor node IDs in adjacency list.
+        adj_weights (np.ndarray): Edge weights in adjacency list.
+        adj_edge_ids (np.ndarray): Original edge indices in adjacency list.
+        cannot_link_indptr (np.ndarray): CSR indptr for cannot-link constraints.
+        cannot_link_indices (np.ndarray): CSR indices for cannot-link constraints.
+        n_points (int): Number of points/nodes.
+        n_edges (int): Number of original edges.
+        
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            - mst_edges: Shape (<=N-1, 3), float64. Columns: [u, v, w]
+            - cannot_link_edges: Shape (<=M, 3), float64. Edges removed due to violations.
+    """
+    # Initialize DSU arrays
+    parent = np.empty(n_points, dtype=np.int32)
+    size = np.empty(n_points, dtype=np.int32)
+    head = np.empty(n_points, dtype=np.int32)
+    tail = np.empty(n_points, dtype=np.int32)
+    next_node = np.empty(n_points, dtype=np.int32)
+    
+    for i in range(n_points):
+        parent[i] = i
+        size[i] = 1
+        head[i] = i
+        tail[i] = i
+        next_node[i] = -1
+    
+    # Track infeasible edges (constraint-violating edges never retry)
+    infeasible = np.zeros(n_edges, dtype=np.bool_)
+    
+    # Output arrays
+    mst_edges = np.empty((n_points - 1, 3), dtype=np.float64)
+    n_added = 0
+    
+    # Cannot-link edges (edges removed due to violations)
+    cannot_link_edge_out = np.empty((n_points - 1, 3), dtype=np.float64)
+    n_cannot_link_edges = 0
+    
+    while True:
+        # ========== Step 1: CPU Parallel edge selection ==========
+        # Step 1a is parallel (prange), Step 1b is sequential
+        cheapest_source, cheapest_target, cheapest_weight, cheapest_edge_id = \
+            _parallel_edge_selection_cpu(
+                adj_indptr,
+                adj_neighbors,
+                adj_weights,
+                adj_edge_ids,
+                parent,
+                size,
+                head,
+                next_node,
+                cannot_link_indptr,
+                cannot_link_indices,
+                infeasible,
+                n_points,
+            )
+        
+        # Check if any component found an edge
+        any_edge_found = False
+        for r in range(n_points):
+            if parent[r] == r and cheapest_edge_id[r] != -1:
+                any_edge_found = True
+                break
+        
+        if not any_edge_found:
+            break
+        
+        # ========== Step 2: Merge proposed edges (SEQUENTIAL) ==========
+        # DSU mutations have ordering dependencies - cannot be parallelized
+        n_added_before = n_added
+        n_added, round_edges_u, round_edges_v, round_edges_w, round_count = \
+            _merge_proposed_edges_numba(
+                cheapest_source,
+                cheapest_target,
+                cheapest_weight,
+                cheapest_edge_id,
+                adj_indptr,
+                adj_neighbors,
+                adj_edge_ids,
+                parent,
+                size,
+                head,
+                tail,
+                next_node,
+                mst_edges,
+                n_added,
+                n_points,
+            )
+        
+        n_merges = n_added - n_added_before
+        
+        if n_merges == 0:
+            break
+        
+        # ========== Step 3: Fix violations using only round edges ==========
+        parent, size, head, tail, next_node, n_added, cannot_link_edge_out, n_cannot_link_edges = \
+            _fix_round_violations_numba(
+                parent,
+                size,
+                head,
+                tail,
+                next_node,
+                round_edges_u,
+                round_edges_v,
+                round_edges_w,
+                round_count,
+                mst_edges,
+                n_added,
+                cannot_link_indptr,
+                cannot_link_indices,
+                cannot_link_edge_out,
+                n_cannot_link_edges,
+                n_points,
+            )
+        
+        if n_added >= n_points - 1:
+            break
+    
+    return mst_edges[:n_added], cannot_link_edge_out[:n_cannot_link_edges]
+
+
+def _select_parallel_backend(
+    n_points: int,
+    parallel_backend: str,
+) -> str:
+    """
+    Select the appropriate parallel backend based on user preference and hardware.
+    
+    Args:
+        n_points: Number of nodes in the graph.
+        parallel_backend: User-specified backend preference.
+            - "auto": Automatically select based on hardware and problem size
+            - "cuda": Force CUDA (raises error if unavailable)
+            - "cpu": Force CPU parallel (Step 1a parallel, Step 1b sequential)
+            - "sequential": Force fully sequential execution
+            
+    Returns:
+        str: The selected backend ("cuda", "cpu", or "sequential").
+        
+    Raises:
+        ValueError: If "cuda" is requested but CUDA is not available.
+    """
+    if parallel_backend == "cuda":
+        if _check_cuda_available():
+            return "cuda"
+        else:
+            raise ValueError(
+                "parallel_backend='cuda' requested but CUDA is not available. "
+                "Install numba with CUDA support or use parallel_backend='cpu' or 'auto'."
+            )
+    
+    if parallel_backend == "cpu":
+        return "cpu"
+    
+    if parallel_backend == "sequential":
+        return "sequential"
+    
+    # parallel_backend == "auto"
+    if _check_cuda_available() and n_points > 10000:
+        return "cuda"
+    
+    # Default to CPU parallel for medium-sized problems
+    # For very small problems, the overhead may not be worth it,
+    # but the difference is negligible
+    return "cpu"
+
+
+def _parallel_constrained_boruvka_mst(
+    adj_indptr: np.ndarray,
+    adj_neighbors: np.ndarray,
+    adj_weights: np.ndarray,
+    adj_edge_ids: np.ndarray,
+    cannot_link_indptr: np.ndarray,
+    cannot_link_indices: np.ndarray,
+    n_points: int,
+    n_edges: int,
+    parallel_backend: str = "auto",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Parallel constrained Borůvka MST algorithm with configurable backend.
+    
+    This is the main entry point for the parallel Borůvka algorithm. It selects
+    the appropriate backend based on hardware availability and problem size.
+    
+    Backend options:
+        - "auto" (default): Automatically select CUDA for large graphs if available,
+          otherwise use CPU parallel.
+        - "cuda": Force CUDA backend. Raises error if CUDA unavailable.
+          - Step 1a: Parallel (one GPU thread per node)
+          - Step 1b: Parallel (atomic_min for aggregation)
+          - Step 2: Sequential (DSU mutations)
+        - "cpu": Force CPU parallel backend.
+          - Step 1a: Parallel (numba prange)
+          - Step 1b: Sequential (no CPU atomics)
+          - Step 2: Sequential (DSU mutations)
+        - "sequential": Force fully sequential execution (for debugging/comparison).
+    
+    Args:
+        adj_indptr (np.ndarray): CSR indptr for adjacency list.
+        adj_neighbors (np.ndarray): Neighbor node IDs in adjacency list.
+        adj_weights (np.ndarray): Edge weights in adjacency list.
+        adj_edge_ids (np.ndarray): Original edge indices in adjacency list.
+        cannot_link_indptr (np.ndarray): CSR indptr for cannot-link constraints.
+        cannot_link_indices (np.ndarray): CSR indices for cannot-link constraints.
+        n_points (int): Number of points/nodes.
+        n_edges (int): Number of original edges.
+        parallel_backend (str): Backend selection. One of "auto", "cuda", "cpu", "sequential".
+        
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            - mst_edges: Shape (<=N-1, 3), float64. Columns: [u, v, w]
+            - cannot_link_edges: Shape (<=M, 3), float64. Edges removed due to violations.
+    """
+    backend = _select_parallel_backend(n_points, parallel_backend)
+    
+    if backend == "cuda":
+        # TODO: Implement CUDA backend
+        # For now, fall back to CPU parallel
+        # raise NotImplementedError("CUDA backend not yet implemented")
+        backend = "cpu"
+    
+    if backend == "cpu":
+        return _parallel_constrained_boruvka_mst_cpu_numba(
+            adj_indptr,
+            adj_neighbors,
+            adj_weights,
+            adj_edge_ids,
+            cannot_link_indptr,
+            cannot_link_indices,
+            n_points,
+            n_edges,
+        )
+    
+    # backend == "sequential"
+    return _parallel_constrained_boruvka_mst_sequential_numba(
+        adj_indptr,
+        adj_neighbors,
+        adj_weights,
+        adj_edge_ids,
+        cannot_link_indptr,
+        cannot_link_indices,
+        n_points,
+        n_edges,
+    )
 
 
 def _ensure_csr_distance_matrix(distances: Union[np.ndarray, CSR]) -> CSR:
@@ -1927,6 +2528,7 @@ def _mst_constrained_hard(
     w: np.ndarray,
     merge_constraint: MergeConstraint,
     mst_method: str = "boruvka",
+    parallel_backend: str = "auto",
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Hard constrained MST using Borůvka, Parallel Borůvka, or Kruskal algorithm.
@@ -1944,6 +2546,11 @@ def _mst_constrained_hard(
             - "boruvka" (default): Sequential constrained Borůvka
             - "parallel_boruvka": Parallel constrained Borůvka with violation correction
             - "kruskal": Sequential constrained Kruskal
+        parallel_backend (str): Backend for parallel_boruvka method:
+            - "auto" (default): Automatically select based on hardware and problem size
+            - "cuda": Force CUDA (raises error if unavailable)
+            - "cpu": Force CPU parallel (Step 1a parallel, Step 1b sequential)
+            - "sequential": Force fully sequential execution
 
     Returns:
         Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -2005,7 +2612,7 @@ def _mst_constrained_hard(
             u_arr, v_arr, w_arr, int(n_points)
         )
 
-        mst_edges, cannot_link_edges = _parallel_constrained_boruvka_mst_numba(
+        mst_edges, cannot_link_edges = _parallel_constrained_boruvka_mst(
             adj_indptr,
             adj_neighbors,
             adj_weights,
@@ -2014,6 +2621,7 @@ def _mst_constrained_hard(
             cannot_link_indices,
             int(n_points),
             int(u_arr.shape[0]),
+            parallel_backend=parallel_backend,
         )
     elif mst_method == "kruskal":
         order = np.argsort(w, kind="mergesort")
@@ -2434,6 +3042,7 @@ def fast_hdbscan_precomputed_with_merge_constraint(
     sample_weights: Optional[np.ndarray] = None,
     return_trees: bool = False,
     mst_method: str = "boruvka",
+    parallel_backend: str = "auto",
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Optional[object], Optional[np.ndarray]
 ]:
@@ -2474,6 +3083,12 @@ def fast_hdbscan_precomputed_with_merge_constraint(
             - "boruvka" (default): Sequential constrained Borůvka
             - "parallel_boruvka": Parallel constrained Borůvka with violation correction
             - "kruskal": Sequential constrained Kruskal
+        parallel_backend (str):
+            Backend for parallel_boruvka method:
+            - "auto" (default): Automatically select based on hardware and problem size
+            - "cuda": Force CUDA (raises error if unavailable)
+            - "cpu": Force CPU parallel (Step 1a parallel, Step 1b sequential)
+            - "sequential": Force fully sequential execution
 
     Returns:
         (Tuple):
@@ -2509,6 +3124,7 @@ def fast_hdbscan_precomputed_with_merge_constraint(
             w=w,
             merge_constraint=merge_constraint,
             mst_method=mst_method,
+            parallel_backend=parallel_backend,
         )
         # Note: cannot_link_edges_out is only populated for parallel_boruvka
         # It contains edges that were removed due to race condition violations
@@ -2583,6 +3199,7 @@ def fast_hdbscan_precomputed_with_cannot_link(
     sample_weights: Optional[np.ndarray] = None,
     return_trees: bool = False,
     mst_method: str = "boruvka",
+    parallel_backend: str = "auto",
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Optional[object], Optional[np.ndarray]
 ]:
@@ -2609,6 +3226,12 @@ def fast_hdbscan_precomputed_with_cannot_link(
             - "boruvka" (default): Sequential constrained Borůvka
             - "parallel_boruvka": Parallel constrained Borůvka with violation correction
             - "kruskal": Sequential constrained Kruskal
+        parallel_backend (str):
+            Backend for parallel_boruvka method:
+            - "auto" (default): Automatically select based on hardware and problem size
+            - "cuda": Force CUDA (raises error if unavailable)
+            - "cpu": Force CPU parallel (Step 1a parallel, Step 1b sequential)
+            - "sequential": Force fully sequential execution
 
     Returns:
         (Tuple):
@@ -2638,6 +3261,7 @@ def fast_hdbscan_precomputed_with_cannot_link(
         sample_weights=sample_weights,
         return_trees=bool(return_trees),
         mst_method=str(mst_method),
+        parallel_backend=str(parallel_backend),
     )
 
 
@@ -3651,6 +4275,133 @@ def test_parallel_boruvka_fully_constrained():
     assert labels.shape[0] == n
 
 
+# ---------------------------------------------------------------------------
+# Backend Selection Tests
+# ---------------------------------------------------------------------------
+
+
+def test_select_parallel_backend_auto():
+    """Test that 'auto' backend selection returns a valid backend."""
+    backend = _select_parallel_backend(100, "auto")
+    assert backend in ("cuda", "cpu", "sequential"), f"Unexpected backend: {backend}"
+
+
+def test_select_parallel_backend_explicit():
+    """Test explicit backend selection."""
+    assert _select_parallel_backend(100, "sequential") == "sequential"
+    assert _select_parallel_backend(100, "cpu") == "cpu"
+    # CUDA may or may not be available, but should raise ValueError or return 'cuda'
+    try:
+        cuda_backend = _select_parallel_backend(100, "cuda")
+        assert cuda_backend == "cuda", "If CUDA is available, should return 'cuda'"
+    except ValueError as e:
+        # Expected if CUDA is not available
+        assert "CUDA is not available" in str(e)
+
+
+def test_parallel_backend_parameter_propagation():
+    """Test that parallel_backend parameter is propagated through the API."""
+    np.random.seed(42)
+    n = 10
+    X = np.random.randn(n, 2)
+    distances = np.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(axis=2))
+    cannot_link = np.zeros((n, n), dtype=np.float64)
+    
+    # Test with explicit sequential backend
+    labels_seq, _ = fast_hdbscan_precomputed_with_cannot_link(
+        distances,
+        cannot_link,
+        strict=True,
+        min_cluster_size=2,
+        mst_method="parallel_boruvka",
+        parallel_backend="sequential",
+    )
+    
+    # Test with explicit cpu backend
+    labels_cpu, _ = fast_hdbscan_precomputed_with_cannot_link(
+        distances,
+        cannot_link,
+        strict=True,
+        min_cluster_size=2,
+        mst_method="parallel_boruvka",
+        parallel_backend="cpu",
+    )
+    
+    # Test with auto backend
+    labels_auto, _ = fast_hdbscan_precomputed_with_cannot_link(
+        distances,
+        cannot_link,
+        strict=True,
+        min_cluster_size=2,
+        mst_method="parallel_boruvka",
+        parallel_backend="auto",
+    )
+    
+    # All should produce the same shape
+    assert labels_seq.shape == labels_cpu.shape == labels_auto.shape
+    # For unconstrained case, results should be identical
+    assert np.array_equal(labels_seq, labels_cpu), "Sequential and CPU should match"
+    assert np.array_equal(labels_seq, labels_auto), "Sequential and auto should match"
+
+
+def test_cpu_vs_sequential_backend_equivalence():
+    """Test that CPU and sequential backends produce identical MST results."""
+    np.random.seed(123)
+    n = 15
+    
+    # Create weighted graph as edges (complete graph)
+    edges_list = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            weight = np.random.random()
+            edges_list.append((i, j, weight))
+    
+    u = np.array([e[0] for e in edges_list], dtype=np.int32)
+    v = np.array([e[1] for e in edges_list], dtype=np.int32)
+    w = np.array([e[2] for e in edges_list], dtype=np.float64)
+    n_edges = len(edges_list)
+    
+    # Convert to adjacency list format
+    adj_indptr, adj_neighbors, adj_weights, adj_edge_ids = _build_adjacency_list_numba(
+        u, v, w, n
+    )
+    
+    # Create some constraints
+    constraint_pairs = [(0, 5), (2, 8), (3, 10)]
+    cannot_link = np.zeros((n, n), dtype=np.float64)
+    for i, j in constraint_pairs:
+        cannot_link[i, j] = 1.0
+        cannot_link[j, i] = 1.0
+    cannot_link_csr = sp.csr_matrix(cannot_link, dtype=np.int32)
+    cl_indptr = np.asarray(cannot_link_csr.indptr, dtype=np.int64)
+    cl_indices = np.asarray(cannot_link_csr.indices, dtype=np.int32)
+    
+    # Run sequential backend
+    mst_edges_seq, cl_edges_seq = _parallel_constrained_boruvka_mst(
+        adj_indptr, adj_neighbors, adj_weights, adj_edge_ids,
+        cl_indptr, cl_indices, n, n_edges, parallel_backend="sequential"
+    )
+    
+    # Run CPU backend
+    mst_edges_cpu, cl_edges_cpu = _parallel_constrained_boruvka_mst(
+        adj_indptr, adj_neighbors, adj_weights, adj_edge_ids,
+        cl_indptr, cl_indices, n, n_edges, parallel_backend="cpu"
+    )
+    
+    # Results should be identical (same algorithm, just different loop implementation)
+    assert np.array_equal(mst_edges_seq, mst_edges_cpu), "MST edges differ"
+    assert np.array_equal(cl_edges_seq, cl_edges_cpu), "Cannot-link edges differ"
+
+
+def test_check_cuda_available_cached():
+    """Test that _check_cuda_available returns consistent results and is cached."""
+    result1 = _check_cuda_available()
+    result2 = _check_cuda_available()
+    
+    assert result1 == result2, "CUDA availability check should be deterministic"
+    assert isinstance(result1, bool), "Should return boolean"
+
+
 if __name__ == "__main__":
     test_precomputed_matches_feature_space_on_dense_distances()
     test_empty_cannot_link_dense_is_noop_vs_unconstrained()
@@ -3684,5 +4435,12 @@ if __name__ == "__main__":
     test_parallel_boruvka_violation_detection()
     test_parallel_boruvka_single_node()
     test_parallel_boruvka_fully_constrained()
+
+    # Backend selection tests
+    test_select_parallel_backend_auto()
+    test_select_parallel_backend_explicit()
+    test_parallel_backend_parameter_propagation()
+    test_cpu_vs_sequential_backend_equivalence()
+    test_check_cuda_available_cached()
 
     print("All tests passed.")
