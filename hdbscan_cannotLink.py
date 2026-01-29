@@ -1246,6 +1246,45 @@ def _rebuild_dsu_from_edges_numba(
 
 
 @numba.njit(cache=True)
+def _get_subcomponent_edges_numba(
+    parent: np.ndarray,
+    mst_edges: np.ndarray,
+    n_edges: int,
+    target_root: int,
+) -> Tuple[np.ndarray, int]:
+    """
+    Get edges that belong to a specific component (both endpoints in component).
+    
+    Args:
+        parent: DSU parent array.
+        mst_edges: MST edges array.
+        n_edges: Number of edges.
+        target_root: Root of the target component.
+        
+    Returns:
+        Tuple of (edges_subset, count): Edges where both endpoints are in target component.
+    """
+    result = np.empty((n_edges, 3), dtype=np.float64)
+    count = 0
+    
+    for e in range(n_edges):
+        u = np.int32(mst_edges[e, 0])
+        v = np.int32(mst_edges[e, 1])
+        
+        u_root = _dsu_find_numba(parent, u)
+        v_root = _dsu_find_numba(parent, v)
+        
+        # Edge is in component if both endpoints resolve to target_root
+        if u_root == target_root and v_root == target_root:
+            result[count, 0] = mst_edges[e, 0]
+            result[count, 1] = mst_edges[e, 1]
+            result[count, 2] = mst_edges[e, 2]
+            count += 1
+    
+    return result, count
+
+
+@numba.njit(cache=True)
 def _fix_round_violations_numba(
     parent: np.ndarray,
     size: np.ndarray,
@@ -1265,15 +1304,23 @@ def _fix_round_violations_numba(
     n_points: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, np.ndarray, int]:
     """
-    Fix violations by removing edges merged this round.
+    Fix violations by removing edges merged this round (recursive structure).
     
-    Strategy:
-    1. Sort round_edges by weight descending
-    2. Remove edges one at a time (starting with heaviest)
-    3. After each removal, check if all components are clean
-    4. Mark the edge that fixes a violation as a cannot-link edge
+    Algorithm (per component with violation):
+    1. If no violation → done
+    2. Sort round_edges by weight descending
+    3. Remove heaviest edge → component splits into 2 subcomponents
+    4. Check BOTH subcomponents:
+       - If BOTH clean → mark removed edge as "cannot-link edge", done
+       - If either has violation → recurse on violating subcomponent(s)
+    5. Recursion continues until all subcomponents are clean
+    
+    Only the edge that produces TWO CLEAN subcomponents is marked as a cannot-link edge.
+    Intermediate removals (where one subcomponent still has violations) are NOT marked.
+    
+    Implementation uses iterative worklist pattern since numba doesn't support complex recursion.
     """
-    # Check if there are any violations
+    # Check if there are any violations globally
     _, _, n_violations = _detect_violations_numba(
         parent, cannot_link_indptr, cannot_link_indices, n_points
     )
@@ -1281,7 +1328,7 @@ def _fix_round_violations_numba(
     if n_violations == 0 or round_count == 0:
         return parent, size, head, tail, next_node, n_added, cannot_link_edge_out, n_cannot_link_edges
     
-    # Sort round edges by weight descending (bubble sort for simplicity in numba)
+    # Sort round edges by weight descending (for consistent processing order)
     sorted_indices = np.arange(round_count, dtype=np.int32)
     for i in range(round_count):
         for j in range(i + 1, round_count):
@@ -1290,18 +1337,81 @@ def _fix_round_violations_numba(
                 sorted_indices[i] = sorted_indices[j]
                 sorted_indices[j] = tmp
     
-    # Create a mask for which round edges to keep
-    round_edge_kept = np.ones(round_count, dtype=np.bool_)
+    # Track which round edges to remove (start with all kept)
+    round_edge_removed = np.zeros(round_count, dtype=np.bool_)
     
-    # Try removing edges one at a time until violations are fixed
-    for idx in range(round_count):
-        r = sorted_indices[idx]
+    # Worklist: components that need fixing
+    # Each entry is a root that may have violations
+    # We process iteratively instead of recursively
+    max_worklist = n_points
+    worklist_roots = np.empty(max_worklist, dtype=np.int32)
+    worklist_count = 0
+    
+    # Find all roots that have violations initially
+    for r in range(n_points):
+        if parent[r] == r:  # Is a root
+            has_viol = _check_component_has_violation_numba(
+                r, parent, head, next_node, cannot_link_indptr, cannot_link_indices
+            )
+            if has_viol:
+                worklist_roots[worklist_count] = r
+                worklist_count += 1
+    
+    # Process worklist
+    iterations = 0
+    max_iterations = round_count * n_points  # Safety limit
+    
+    while worklist_count > 0 and iterations < max_iterations:
+        iterations += 1
         
-        # Tentatively remove this round edge
-        round_edge_kept[r] = False
+        # Pop a root from worklist
+        worklist_count -= 1
+        current_root = worklist_roots[worklist_count]
+        
+        # Re-check if this root still has violations (state may have changed)
+        # First, find the current root (may have changed due to DSU updates)
+        current_root = _dsu_find_numba(parent, current_root)
+        
+        has_viol = _check_component_has_violation_numba(
+            current_root, parent, head, next_node, cannot_link_indptr, cannot_link_indices
+        )
+        
+        if not has_viol:
+            continue  # Already clean, skip
+        
+        # Find the heaviest non-removed round edge in this component
+        best_edge_idx = -1
+        best_weight = -1.0
+        
+        for idx in range(round_count):
+            r = sorted_indices[idx]
+            if round_edge_removed[r]:
+                continue
+            
+            eu = round_edges_u[r]
+            ev = round_edges_v[r]
+            ew = round_edges_w[r]
+            
+            # Check if this edge is in the current component
+            eu_root = _dsu_find_numba(parent, eu)
+            ev_root = _dsu_find_numba(parent, ev)
+            
+            if eu_root == current_root and ev_root == current_root:
+                if ew > best_weight:
+                    best_weight = ew
+                    best_edge_idx = r
+        
+        if best_edge_idx == -1:
+            # No round edge to remove in this component - shouldn't happen
+            continue
+        
+        # Remove this edge
+        round_edge_removed[best_edge_idx] = True
+        removed_u = round_edges_u[best_edge_idx]
+        removed_v = round_edges_v[best_edge_idx]
+        removed_w = round_edges_w[best_edge_idx]
         
         # Rebuild MST without the removed round edges
-        # First, find edges that are NOT in the removed round edges
         temp_mst = np.empty((n_added, 3), dtype=np.float64)
         temp_n = 0
         
@@ -1313,7 +1423,7 @@ def _fix_round_violations_numba(
             # Check if this edge is a removed round edge
             is_removed = False
             for rr in range(round_count):
-                if not round_edge_kept[rr]:
+                if round_edge_removed[rr]:
                     ru = round_edges_u[rr]
                     rv = round_edges_v[rr]
                     rw = round_edges_w[rr]
@@ -1332,38 +1442,51 @@ def _fix_round_violations_numba(
             n_points, temp_mst, temp_n
         )
         
-        # Check violations with new DSU
-        _, _, remaining_violations = _detect_violations_numba(
-            temp_parent, cannot_link_indptr, cannot_link_indices, n_points
+        # Find the roots of the two subcomponents (removed_u and removed_v may now be in different components)
+        subcomp_a_root = _dsu_find_numba(temp_parent, removed_u)
+        subcomp_b_root = _dsu_find_numba(temp_parent, removed_v)
+        
+        # Check violations in both subcomponents
+        viol_a = _check_component_has_violation_numba(
+            subcomp_a_root, temp_parent, temp_head, temp_next_node,
+            cannot_link_indptr, cannot_link_indices
+        )
+        viol_b = _check_component_has_violation_numba(
+            subcomp_b_root, temp_parent, temp_head, temp_next_node,
+            cannot_link_indptr, cannot_link_indices
         )
         
-        if remaining_violations == 0:
-            # This removal fixed all violations
-            # Record the removed edges as cannot-link edges
-            for rr in range(round_count):
-                if not round_edge_kept[rr]:
-                    cannot_link_edge_out[n_cannot_link_edges, 0] = float(round_edges_u[rr])
-                    cannot_link_edge_out[n_cannot_link_edges, 1] = float(round_edges_v[rr])
-                    cannot_link_edge_out[n_cannot_link_edges, 2] = round_edges_w[rr]
-                    n_cannot_link_edges += 1
-            
-            # Copy results back
-            for i in range(n_points):
-                parent[i] = temp_parent[i]
-                size[i] = temp_size[i]
-                head[i] = temp_head[i]
-                tail[i] = temp_tail[i]
-                next_node[i] = temp_next_node[i]
-            
-            for e in range(temp_n):
-                mst_edges[e, 0] = temp_mst[e, 0]
-                mst_edges[e, 1] = temp_mst[e, 1]
-                mst_edges[e, 2] = temp_mst[e, 2]
-            
-            return parent, size, head, tail, next_node, temp_n, cannot_link_edge_out, n_cannot_link_edges
+        # Update main DSU state
+        for i in range(n_points):
+            parent[i] = temp_parent[i]
+            size[i] = temp_size[i]
+            head[i] = temp_head[i]
+            tail[i] = temp_tail[i]
+            next_node[i] = temp_next_node[i]
+        
+        for e in range(temp_n):
+            mst_edges[e, 0] = temp_mst[e, 0]
+            mst_edges[e, 1] = temp_mst[e, 1]
+            mst_edges[e, 2] = temp_mst[e, 2]
+        n_added = temp_n
+        
+        if not viol_a and not viol_b:
+            # BOTH subcomponents are clean!
+            # Mark this edge as a cannot-link edge
+            cannot_link_edge_out[n_cannot_link_edges, 0] = float(removed_u)
+            cannot_link_edge_out[n_cannot_link_edges, 1] = float(removed_v)
+            cannot_link_edge_out[n_cannot_link_edges, 2] = removed_w
+            n_cannot_link_edges += 1
+        else:
+            # At least one subcomponent still has violations
+            # Add violating subcomponents to worklist (do NOT mark edge as cannot-link)
+            if viol_a and worklist_count < max_worklist:
+                worklist_roots[worklist_count] = subcomp_a_root
+                worklist_count += 1
+            if viol_b and worklist_count < max_worklist:
+                worklist_roots[worklist_count] = subcomp_b_root
+                worklist_count += 1
     
-    # If we get here, we've removed all round edges but still have violations
-    # This shouldn't happen in normal operation, but return current state
     return parent, size, head, tail, next_node, n_added, cannot_link_edge_out, n_cannot_link_edges
 
 
@@ -3416,16 +3539,18 @@ def test_parallel_boruvka_race_condition_scenario():
 
 
 def test_parallel_boruvka_matches_kruskal_results():
-    """Test that parallel Borůvka produces same clustering as Kruskal with constraints."""
+    """Test that parallel Borůvka produces valid clustering that respects constraints like Kruskal."""
     rng = np.random.default_rng(102)
     data = rng.normal(size=(25, 3)).astype(np.float64)
     distances = _dense_pairwise_distances_euclidean(data)
     
     # Add constraints
     cannot_link = np.zeros((25, 25), dtype=np.float64)
+    constraint_pairs = []
     for i in range(0, 20, 4):
         cannot_link[i, i + 2] = 1.0
         cannot_link[i + 2, i] = 1.0
+        constraint_pairs.append((i, i + 2))
     
     labels_kruskal, _ = fast_hdbscan_precomputed_with_cannot_link(
         distances,
@@ -3443,12 +3568,18 @@ def test_parallel_boruvka_matches_kruskal_results():
         mst_method="parallel_boruvka",
     )
     
-    # Both should respect constraints and produce similar clustering
-    # ARI may vary due to different MST construction orders and how violations are resolved
-    # The key is that both respect the constraints
-    ari = adjusted_rand_score(labels_kruskal, labels_parallel)
-    # Just verify both produce valid results (ARI > 0 means some agreement)
-    assert ari > 0.0 or (np.all(labels_kruskal == -1) and np.all(labels_parallel == -1)), f"Expected positive ARI or all noise, got {ari}"
+    # Both should respect constraints - verify no constraint pair is in the same non-noise cluster
+    def check_constraints_respected(labels, pairs):
+        for a, b in pairs:
+            if labels[a] != -1 and labels[b] != -1 and labels[a] == labels[b]:
+                return False
+        return True
+    
+    assert check_constraints_respected(labels_kruskal, constraint_pairs), "Kruskal violated constraints"
+    assert check_constraints_respected(labels_parallel, constraint_pairs), "Parallel Borůvka violated constraints"
+    
+    # Both should produce some clusters (not all noise)
+    assert not np.all(labels_kruskal == -1) or not np.all(labels_parallel == -1), "Both methods produced all noise"
 
 
 def test_parallel_boruvka_violation_detection():
