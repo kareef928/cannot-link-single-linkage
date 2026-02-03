@@ -1,27 +1,413 @@
 """
 Minimal HDBSCAN with Cannot-Link Constraints
+=============================================
 
 This module provides a minimal, self-contained implementation of constrained HDBSCAN
 with parallel Borůvka MST and conditional backend selection (CPU/CUDA).
 
-Key Features:
+Key Features
+------------
 - Cannot-link constraints via dense/sparse matrix
 - Three MST methods: boruvka, parallel_boruvka, kruskal
 - Conditional parallel backend: auto, cuda, cpu, sequential
 - Violation detection and correction for parallel algorithm
 
-Algorithm Overview:
-The parallel Borůvka algorithm uses a 3-step round structure:
-    Step 1a: Per-node edge search (PARALLEL on CPU/GPU)
-    Step 1b: Per-component aggregation (SEQUENTIAL on CPU, PARALLEL on GPU with atomics)
-    Step 2:  DSU merge (ALWAYS SEQUENTIAL - ordering dependencies)
-    Step 3:  Violation correction (remove heaviest violating edges)
+MST Algorithm Options
+---------------------
+1. **kruskal**: Classic Kruskal's algorithm with constraint checking
+   - O(E log E) time complexity
+   - Fully sequential, good for small/sparse graphs
+   
+2. **boruvka**: Sequential Borůvka's algorithm with constraints
+   - O(E log V) time complexity
+   - Better cache locality than Kruskal for dense graphs
+   
+3. **parallel_boruvka**: Parallel Borůvka with backend selection
+   - Supports CPU parallel, GPU (CUDA), or sequential execution
+   - Best for large dense graphs where parallelism pays off
 
-Why Step 1b is sequential on CPU but parallel on GPU:
-- Multiple nodes in the same component write to cheapest[root]
-- This is a reduction operation requiring atomic read-modify-write
-- GPU has cuda.atomic.min, CPU has no such primitive in Numba
-- Without atomics, race conditions produce incorrect results
+Parallel Borůvka Algorithm - Step-by-Step
+-----------------------------------------
+Each round of the algorithm processes these steps:
+
+**Step 1a: Per-Node Minimum Edge Search**
+    - Task: Each node finds its cheapest valid outgoing edge
+    - Validity: Edge must connect to different component AND not violate cannot-link
+    - Parallelization: FULLY PARALLEL (CPU prange / GPU threads)
+    - Why parallel: Each node's search is completely independent
+    - Output: node_best_neighbor[i], node_best_weight[i] for each node i
+
+**Step 1b: Per-Component Aggregation**
+    - Task: For each component (DSU tree), find the globally cheapest edge
+    - Challenge: Multiple nodes in same component must agree on one best edge
+    - Parallelization:
+        * GPU (CUDA): PARALLEL using cuda.atomic.min for thread-safe updates
+        * CPU: SEQUENTIAL - Numba lacks atomic primitives, races corrupt results
+    - Output: cheapest_weight[root], cheapest_neighbor[root] per component
+
+**Step 2: DSU Merge Operations**
+    - Task: Add selected edges to MST and merge components via union-find
+    - Parallelization: ALWAYS SEQUENTIAL on both CPU and GPU
+    - Output: Updated DSU parent/rank arrays, edges added to MST
+
+**Step 3: Violation Detection & Correction (Component-Based)**
+    - Task: Remove edges that would create cannot-link violations
+    - When: Only after Step 2 completes (need final component assignments)
+    - Algorithm:
+        1. Build worklist of components that have violations (PARALLEL per component)
+        2. Pop a violating component from worklist
+        3. Remove heaviest edge → splits into 2 sub-components
+        4. Check each sub-component for violations:
+           - If still violating → add back to worklist
+           - If clean → done with that sub-component
+        5. Repeat until worklist empty
+    - Parallelization:
+        * Step 3a (Detection): PARALLEL over components - each component checked independently
+        * Step 3b (Correction): SEQUENTIAL - removing an edge changes the graph structure
+    - Why needed: Parallel edge selection in Step 1 can't see other threads'
+                  choices, so two edges might collectively create a violation
+
+Worked Example: Why Each Step Is Parallel or Sequential
+-------------------------------------------------------
+Consider a graph with 6 nodes and the following edges (sorted by weight):
+
+    Nodes: 0, 1, 2, 3, 4, 5
+    Edges: (0,1,1.0), (2,3,1.5), (1,2,2.0), (3,4,2.5), (4,5,3.0), (0,5,3.5)
+    Cannot-link constraint: (0, 5) -- nodes 0 and 5 must NOT be in same cluster
+    
+    Initial state: Each node is its own component
+    Components: {0}, {1}, {2}, {3}, {4}, {5}
+
+**STEP 1a: Per-Node Search (PARALLEL IS SAFE)**
+
+    Each node independently finds its cheapest outgoing edge:
+    
+    Thread 0: Node 0 searches → finds edge (0,1,1.0) to component {1}
+    Thread 1: Node 1 searches → finds edge (0,1,1.0) to component {0}
+    Thread 2: Node 2 searches → finds edge (2,3,1.5) to component {3}
+    Thread 3: Node 3 searches → finds edge (2,3,1.5) to component {2}
+    Thread 4: Node 4 searches → finds edge (3,4,2.5) to component {3}
+    Thread 5: Node 5 searches → finds edge (4,5,3.0) to component {4}
+    
+    WHY PARALLEL IS SAFE:
+    - Each thread writes to its OWN array slot: node_best[i]
+    - No two threads write to the same memory location
+    - Read-only access to shared data (edges, components)
+    
+    Result: node_best = [(1,1.0), (0,1.0), (3,1.5), (2,1.5), (3,2.5), (4,3.0)]
+
+**STEP 1b: Per-Component Aggregation (CPU: SEQUENTIAL REQUIRED)**
+
+    Now we must pick ONE best edge per component. Initially each node is its
+    own component, so each component's root equals itself.
+    
+    SEQUENTIAL EXECUTION (CORRECT):
+        Process node 0: root=0, cheapest[0] = (neighbor=1, weight=1.0)
+        Process node 1: root=1, cheapest[1] = (neighbor=0, weight=1.0)
+        ... each node is its own root, so no conflicts yet
+    
+    BUT AFTER SOME MERGES, suppose components are: {0,1,2}, {3,4}, {5}
+    And nodes 0,1,2 all have root=0. Now consider:
+        Node 0 found edge (0→3, weight=2.0)
+        Node 1 found edge (1→3, weight=1.8)  ← better!
+        Node 2 found edge (2→5, weight=4.0)
+    
+    PARALLEL EXECUTION (RACE CONDITION - WRONG):
+        Time T1: Thread 0 reads cheapest[0] = inf
+        Time T1: Thread 1 reads cheapest[0] = inf
+        Time T2: Thread 0 writes cheapest[0] = 2.0 (from node 0's edge)
+        Time T3: Thread 1 writes cheapest[0] = 1.8 (from node 1's edge)
+        
+        LUCKY ORDER: Final cheapest[0] = 1.8 ✓
+        
+        BUT if timing differs:
+        Time T2: Thread 1 writes cheapest[0] = 1.8
+        Time T3: Thread 0 writes cheapest[0] = 2.0  ← OVERWRITES BETTER VALUE!
+        
+        UNLUCKY ORDER: Final cheapest[0] = 2.0 ✗ (wrong edge selected!)
+    
+    SEQUENTIAL EXECUTION (CORRECT):
+        Process node 0: cheapest[0] = min(inf, 2.0) = 2.0
+        Process node 1: cheapest[0] = min(2.0, 1.8) = 1.8  ← always picks better
+        Process node 2: cheapest[0] = min(1.8, 4.0) = 1.8  ← keeps best
+        
+        Final cheapest[0] = 1.8 ✓ (correct edge selected!)
+    
+    GPU SOLUTION: cuda.atomic.min performs read-compare-write atomically,
+    so parallel execution is safe. CPU Numba has no such primitive.
+
+**STEP 2: DSU Merge (ALWAYS SEQUENTIAL)**
+
+    Selected edges from Step 1: (0,1,1.0), (2,3,1.5), (4,5,3.0)
+    
+    SEQUENTIAL EXECUTION (CORRECT):
+        Merge 0-1: parent[1]=0, components: {0,1}, {2}, {3}, {4}, {5}
+        Merge 2-3: parent[3]=2, components: {0,1}, {2,3}, {4}, {5}
+        Merge 4-5: parent[5]=4, components: {0,1}, {2,3}, {4,5}
+        
+        DSU state is consistent. 3 edges added to MST.
+    
+    PARALLEL EXECUTION (CORRUPTION - WRONG):
+        Consider if we also try to merge 1-2 and 3-4 in parallel:
+        
+        Thread A: Processing edge (1,2)
+            find(1) → follows parent[1]=0, returns 0
+            find(2) → returns 2
+            About to set parent[2] = 0...
+            
+        Thread B: Processing edge (2,3) simultaneously
+            find(2) → returns 2 (not yet updated!)
+            find(3) → returns 3
+            Sets parent[3] = 2
+            
+        Thread A: Sets parent[2] = 0
+        
+        PROBLEM 1 - Lost update:
+            Node 3 points to 2, but 2 now points to 0
+            Path compression in Thread B didn't see the merge!
+            
+        PROBLEM 2 - Cycle detection broken:
+            Thread C: Processing edge (0,3)
+            find(0) → returns 0
+            find(3) → follows 3→2→0, returns 0
+            Same component! Should skip, but timing could cause:
+            find(3) starts before Thread A completes → returns 2 (wrong root)
+            We add edge (0,3) even though it creates a CYCLE!
+        
+        PROBLEM 3 - Size/rank corruption:
+            Both threads read size[0]=1, size[2]=1
+            Both compute new_size = 2
+            Both write size[root] = 2
+            Actual merged component has 4 nodes, but size says 2!
+
+**STEP 3: Violation Detection & Correction**
+
+    After Step 2, suppose components are: {0,1,2,3,4,5} (all merged)
+    But we have cannot-link(0,5)!
+    
+    DETECTION (PARALLEL IS SAFE):
+        Each constraint pair (i,j) is checked independently:
+        Thread for (0,5): find(0)=0, find(5)=0 → SAME! Violation found.
+        
+        WHY PARALLEL IS SAFE:
+        - Only READS from DSU (no writes)
+        - Each thread checks ONE constraint pair
+        - Writes to separate violation_list slots
+    
+    CORRECTION (SEQUENTIAL REQUIRED):
+        Suppose two violations exist and we must remove edges to fix them:
+        Violation 1: (0,5) in same component due to edge (4,5,3.0)
+        Violation 2: (1,4) in same component due to edge (3,4,2.5)
+        
+        SEQUENTIAL EXECUTION (CORRECT):
+            Fix violation 1: Remove heaviest edge in path 0↔5
+                Path: 0-1-2-3-4-5, heaviest = (4,5,3.0)
+                Remove (4,5,3.0) → now {0,1,2,3,4} and {5}
+                Check: find(0)≠find(5) ✓ Fixed!
+            
+            Fix violation 2: Check if still violated
+                find(1)=0, find(4)=0 → still same component
+                Remove heaviest in path 1↔4 = (3,4,2.5)
+                Remove (3,4,2.5) → now {0,1,2,3}, {4}, {5}
+        
+        PARALLEL EXECUTION (WRONG DECISIONS):
+            Thread A: Fixing (0,5) - finds heaviest edge in component
+            Thread B: Fixing (1,4) - finds heaviest edge in component
+            
+            Both see the SAME component {0,1,2,3,4,5}
+            Both might identify (4,5,3.0) as heaviest
+            Both try to remove it → redundant work, or worse:
+            
+            Thread A removes (4,5,3.0), creating {0,1,2,3,4} and {5}
+            Thread B (not seeing update) removes (3,4,2.5) from original view
+            Now we've removed TOO MANY edges!
+            
+            Or Thread B finds (4,5,3.0) already removed, gets confused
+            about the current graph structure.
+        
+        WHY SEQUENTIAL IS REQUIRED:
+        - Removing edge E1 changes which edges exist for violation 2
+        - Must re-check if violation still exists after each fix
+        - Graph structure changes with each removal
+
+Detailed Example: Why Step 2 AND Step 3b Must Be Sequential
+-----------------------------------------------------------
+Consider this scenario where parallel execution of Step 2 OR Step 3b fails:
+
+    Graph: 8 nodes arranged as two "diamonds" connected by a bridge
+    
+         1           5
+        /|\\         /|\\
+       / | \\       / | \\
+      0  |  2-----4  |  6
+       \\ | /       \\ | /
+        \\|/         \\|/
+         3           7
+    
+    Edges (sorted by weight):
+      (0,1,1), (0,3,1), (1,2,2), (2,3,2), (1,3,2.5),  ← left diamond
+      (4,5,1), (4,7,1), (5,6,2), (6,7,2), (5,7,2.5),  ← right diamond
+      (2,4,3)  ← bridge connecting the diamonds
+    
+    Cannot-link constraints: (0,2), (4,6)
+    
+    Initial components: {0},{1},{2},{3},{4},{5},{6},{7}
+
+**ROUND 1 - Step 1: Edge Selection**
+    Each component picks cheapest outgoing edge:
+    {0}→(0,1,1), {1}→(0,1,1), {2}→(1,2,2), {3}→(0,3,1)
+    {4}→(4,5,1), {5}→(4,5,1), {6}→(5,6,2), {7}→(4,7,1)
+    
+    Selected: (0,1), (0,3), (4,5), (4,7)
+
+**ROUND 1 - Step 2: Merging (WHY SEQUENTIAL IS REQUIRED)**
+
+    SEQUENTIAL (CORRECT):
+        Merge (0,1): {0,1}, {2}, {3}, {4}, {5}, {6}, {7}
+        Merge (0,3): {0,1,3}, {2}, {4}, {5}, {6}, {7}
+        Merge (4,5): {0,1,3}, {2}, {4,5}, {6}, {7}
+        Merge (4,7): {0,1,3}, {2}, {4,5,7}, {6}
+        
+        DSU is consistent. 4 edges added.
+    
+    PARALLEL (WRONG) - Processing (0,1), (0,3), (1,3) simultaneously:
+        Thread A: Merge (0,1)
+            find(0)=0, find(1)=1, different → merge
+            parent[1]=0, size[0]=2
+            
+        Thread B: Merge (0,3) at same time
+            find(0)=0, find(3)=3, different → merge
+            parent[3]=0, size[0]=2  ← RACE! Should be 3!
+            
+        Thread C: Merge (1,3) at same time
+            find(1)=? → might return 1 (not yet updated) or 0
+            find(3)=? → might return 3 (not yet updated) or 0
+            
+            If both return old values: adds edge (1,3) to MST
+            But 1 and 3 are already in same component via 0!
+            CYCLE CREATED IN MST!
+
+**ROUND 2 - More complex scenario showing Step 3b parallel failure**
+
+    After some rounds, suppose we have:
+    Components: {0,1,2,3} and {4,5,6,7}
+    MST edges in left: (0,1), (0,3), (1,2)  
+    MST edges in right: (4,5), (4,7), (5,6)
+    
+    Now bridge edge (2,4,3) is selected, merging everything:
+    Component: {0,1,2,3,4,5,6,7}
+    
+    Violations detected:
+      - (0,2): both in same component
+      - (4,6): both in same component
+    
+    PARALLEL Step 3b (WRONG):
+        Thread A handles violation (0,2):
+            Component has edges: (0,1), (0,3), (1,2), (4,5), (4,7), (5,6), (2,4)
+            Heaviest edge containing path 0↔2: could be (2,4,3) or (1,2,2)
+            Thread A picks (2,4,3), removes it
+            Now: {0,1,2,3} and {4,5,6,7}
+            
+        Thread B handles violation (4,6) AT THE SAME TIME:
+            Thread B still sees OLD graph with edge (2,4,3) present!
+            Thread B computes path 4↔6 in the FULL component
+            Thread B picks (2,4,3) as heaviest (or (5,6,2))
+            
+            CASE 1: Both remove (2,4,3)
+                Redundant work, but result might be okay
+                
+            CASE 2: Thread A removes (2,4,3), Thread B removes (5,6,2)
+                Thread B's decision was based on old graph state
+                After Thread A's removal, violation (4,6) is in component {4,5,6,7}
+                The correct edge to remove would be (5,6,2) anyway... 
+                BUT Thread B might have computed wrong heaviest!
+                
+            CASE 3: Interleaved DSU updates
+                Thread A: parent[4] changes during Thread B's find()
+                Thread B gets inconsistent view of components
+                Thread B removes wrong edge entirely
+    
+    SEQUENTIAL Step 3b (CORRECT):
+        Worklist: [{0,1,2,3,4,5,6,7}]  ← one big violating component
+        
+        Pop component, check violations:
+            (0,2): find(0)=0, find(2)=0 → YES
+            (4,6): find(4)=0, find(6)=0 → YES
+        Has violations, find heaviest round edge: (2,4,3)
+        Remove (2,4,3)
+        
+        Now two sub-components: {0,1,2,3} and {4,5,6,7}
+        
+        Check {0,1,2,3}: has (0,2) violation?
+            find(0)=0, find(2)=0 → YES, still violating
+            Add to worklist
+            
+        Check {4,5,6,7}: has (4,6) violation?
+            find(4)=4, find(6)=4 → YES, still violating
+            Add to worklist
+        
+        Worklist: [{0,1,2,3}, {4,5,6,7}]
+        
+        Pop {0,1,2,3}:
+            Heaviest round edge in this component: (1,2,2)
+            Remove (1,2,2)
+            Sub-components: {0,1,3} and {2}
+            Check {0,1,3}: (0,2) violation? find(2)=2 ≠ find(0)=0 → NO ✓
+            Check {2}: no constraints → NO ✓
+            Both clean, don't add to worklist
+        
+        Pop {4,5,6,7}:
+            Heaviest round edge: (5,6,2)
+            Remove (5,6,2)
+            Sub-components: {4,5,7} and {6}
+            Check {4,5,7}: (4,6) violation? find(6)=6 ≠ find(4)=4 → NO ✓
+            Check {6}: no constraints → NO ✓
+            Both clean
+        
+        Worklist empty → done!
+        
+        Final valid MST: (0,1), (0,3), (4,5), (4,7)
+        Removed edges: (2,4,3), (1,2,2), (5,6,2)
+
+Backend Selection Logic
+-----------------------
+The `parallel_backend` parameter controls execution:
+
+- **"auto"**: Detects CUDA availability at runtime
+    * If CUDA available and working → uses "cuda"
+    * Otherwise → falls back to "cpu"
+    
+- **"cuda"**: Forces GPU execution
+    * Step 1a: GPU parallel (one thread per node)
+    * Step 1b: GPU parallel with atomics
+    * Step 2: Sequential on GPU (single thread block)
+    * Requires: numba.cuda, compatible NVIDIA GPU
+    
+- **"cpu"**: Forces CPU parallel execution
+    * Step 1a: CPU parallel (numba.prange across cores)
+    * Step 1b: Sequential (no CPU atomics in Numba)
+    * Step 2: Sequential
+    * Best for: Multi-core CPUs, medium-large graphs
+    
+- **"sequential"**: Forces fully sequential execution
+    * All steps run sequentially on single CPU core
+    * Best for: Debugging, small graphs, reproducibility
+
+Performance Characteristics
+---------------------------
+- Small graphs (<1000 nodes): kruskal or sequential often fastest (less overhead)
+- Medium graphs (1K-100K nodes): cpu backend with parallel_boruvka
+- Large graphs (>100K nodes): cuda backend if GPU available
+- Very sparse graphs: kruskal (fewer edges to sort)
+- Dense graphs: parallel_boruvka (more parallelism opportunity)
+
+Cannot-Link Constraint Handling
+-------------------------------
+- Constraints stored as CSR sparse matrix for O(1) lookup
+- During edge selection: skip edges connecting constrained pairs
+- During merging: edges that would merge constrained nodes into same
+  component are detected and the heaviest is removed
+- Final result: guaranteed no cluster contains cannot-link pairs
 """
 from __future__ import annotations
 
@@ -814,6 +1200,46 @@ def _check_component_has_violation_numba(
     return False
 
 
+@numba.njit(parallel=True, cache=True)
+def _detect_violating_components_parallel(
+    parent: np.ndarray,
+    head: np.ndarray,
+    next_node: np.ndarray,
+    cannot_link_indptr: np.ndarray,
+    cannot_link_indices: np.ndarray,
+    n_points: int,
+) -> np.ndarray:
+    """
+    Step 3a: Parallel detection of which components have violations.
+    
+    Each root is checked independently in parallel. Returns a boolean array
+    where has_violation[r] = True if component with root r has a violation.
+    """
+    has_violation = np.zeros(n_points, dtype=np.bool_)
+    
+    for r in prange(n_points):
+        if parent[r] == r:  # Is a root
+            # Check this component for violations (read-only, safe for parallel)
+            node = head[r]
+            found_violation = False
+            while node != -1 and not found_violation:
+                start = cannot_link_indptr[node]
+                end = cannot_link_indptr[node + 1]
+                for k in range(start, end):
+                    partner = cannot_link_indices[k]
+                    # Use readonly find to avoid path compression races
+                    partner_root = partner
+                    while parent[partner_root] != partner_root:
+                        partner_root = parent[partner_root]
+                    if partner_root == r:
+                        found_violation = True
+                        break
+                node = next_node[node]
+            has_violation[r] = found_violation
+    
+    return has_violation
+
+
 @numba.njit(cache=True)
 def _rebuild_dsu_from_edges_numba(
     n_points: int,
@@ -855,6 +1281,143 @@ def _rebuild_dsu_from_edges_numba(
 
 
 @numba.njit(cache=True)
+def _fix_round_violations_with_initial_worklist_numba(
+    parent: np.ndarray, size: np.ndarray, head: np.ndarray, tail: np.ndarray, next_node: np.ndarray,
+    round_edges_u: np.ndarray, round_edges_v: np.ndarray, round_edges_w: np.ndarray, round_count: int,
+    mst_edges: np.ndarray, n_added: int,
+    cannot_link_indptr: np.ndarray, cannot_link_indices: np.ndarray,
+    cannot_link_edge_out: np.ndarray, n_cannot_link_edges: int, n_points: int,
+    initial_worklist: np.ndarray, initial_worklist_count: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, np.ndarray, int]:
+    """
+    Fix violations given a pre-computed initial worklist (Step 3b - sequential correction).
+    
+    This version accepts the initial worklist of violating components computed externally
+    (potentially in parallel), then does sequential correction.
+    """
+    if initial_worklist_count == 0 or round_count == 0:
+        return parent, size, head, tail, next_node, n_added, cannot_link_edge_out, n_cannot_link_edges
+    
+    # Sort round edges by weight descending
+    sorted_indices = np.arange(round_count, dtype=np.int32)
+    for i in range(round_count):
+        for j in range(i + 1, round_count):
+            if round_edges_w[sorted_indices[i]] < round_edges_w[sorted_indices[j]]:
+                sorted_indices[i], sorted_indices[j] = sorted_indices[j], sorted_indices[i]
+    
+    round_edge_removed = np.zeros(round_count, dtype=np.bool_)
+    max_worklist = n_points
+    worklist_roots = np.empty(max_worklist, dtype=np.int32)
+    
+    # Copy initial worklist
+    worklist_count = initial_worklist_count
+    for i in range(initial_worklist_count):
+        worklist_roots[i] = initial_worklist[i]
+    
+    iterations = 0
+    max_iterations = round_count * n_points
+    
+    while worklist_count > 0 and iterations < max_iterations:
+        iterations += 1
+        worklist_count -= 1
+        current_root = worklist_roots[worklist_count]
+        current_root = _dsu_find_numba(parent, current_root)
+        
+        has_viol = _check_component_has_violation_numba(
+            current_root, parent, head, next_node, cannot_link_indptr, cannot_link_indices
+        )
+        if not has_viol:
+            continue
+        
+        best_edge_idx = -1
+        best_weight = -1.0
+        
+        for idx in range(round_count):
+            r = sorted_indices[idx]
+            if round_edge_removed[r]:
+                continue
+            eu, ev, ew = round_edges_u[r], round_edges_v[r], round_edges_w[r]
+            eu_root = _dsu_find_numba(parent, eu)
+            ev_root = _dsu_find_numba(parent, ev)
+            if eu_root == current_root and ev_root == current_root:
+                if ew > best_weight:
+                    best_weight = ew
+                    best_edge_idx = r
+        
+        if best_edge_idx == -1:
+            continue
+        
+        round_edge_removed[best_edge_idx] = True
+        removed_u = round_edges_u[best_edge_idx]
+        removed_v = round_edges_v[best_edge_idx]
+        removed_w = round_edges_w[best_edge_idx]
+        
+        temp_mst = np.empty((n_added, 3), dtype=np.float64)
+        temp_n = 0
+        
+        for e in range(n_added):
+            eu = np.int32(mst_edges[e, 0])
+            ev = np.int32(mst_edges[e, 1])
+            ew = mst_edges[e, 2]
+            
+            is_removed = False
+            for rr in range(round_count):
+                if round_edge_removed[rr]:
+                    ru, rv, rw = round_edges_u[rr], round_edges_v[rr], round_edges_w[rr]
+                    if ((eu == ru and ev == rv) or (eu == rv and ev == ru)) and ew == rw:
+                        is_removed = True
+                        break
+            
+            if not is_removed:
+                temp_mst[temp_n, 0] = mst_edges[e, 0]
+                temp_mst[temp_n, 1] = mst_edges[e, 1]
+                temp_mst[temp_n, 2] = mst_edges[e, 2]
+                temp_n += 1
+        
+        temp_parent, temp_size, temp_head, temp_tail, temp_next_node = _rebuild_dsu_from_edges_numba(
+            n_points, temp_mst, temp_n
+        )
+        
+        subcomp_a_root = _dsu_find_numba(temp_parent, removed_u)
+        subcomp_b_root = _dsu_find_numba(temp_parent, removed_v)
+        
+        viol_a = _check_component_has_violation_numba(
+            subcomp_a_root, temp_parent, temp_head, temp_next_node, cannot_link_indptr, cannot_link_indices
+        )
+        viol_b = _check_component_has_violation_numba(
+            subcomp_b_root, temp_parent, temp_head, temp_next_node, cannot_link_indptr, cannot_link_indices
+        )
+        
+        for i in range(n_points):
+            parent[i] = temp_parent[i]
+            size[i] = temp_size[i]
+            head[i] = temp_head[i]
+            tail[i] = temp_tail[i]
+            next_node[i] = temp_next_node[i]
+        
+        for e in range(temp_n):
+            mst_edges[e, 0] = temp_mst[e, 0]
+            mst_edges[e, 1] = temp_mst[e, 1]
+            mst_edges[e, 2] = temp_mst[e, 2]
+        n_added = temp_n
+        
+        if not viol_a and not viol_b:
+            cannot_link_edge_out[n_cannot_link_edges, 0] = float(removed_u)
+            cannot_link_edge_out[n_cannot_link_edges, 1] = float(removed_v)
+            cannot_link_edge_out[n_cannot_link_edges, 2] = removed_w
+            n_cannot_link_edges += 1
+        else:
+            if viol_a and worklist_count < max_worklist:
+                worklist_roots[worklist_count] = subcomp_a_root
+                worklist_count += 1
+            if viol_b and worklist_count < max_worklist:
+                worklist_roots[worklist_count] = subcomp_b_root
+                worklist_count += 1
+    
+    return parent, size, head, tail, next_node, n_added, cannot_link_edge_out, n_cannot_link_edges
+
+
+@numba.njit(cache=True)
 def _fix_round_violations_numba(
     parent: np.ndarray, size: np.ndarray, head: np.ndarray, tail: np.ndarray, next_node: np.ndarray,
     round_edges_u: np.ndarray, round_edges_v: np.ndarray, round_edges_w: np.ndarray, round_count: int,
@@ -880,6 +1443,10 @@ def _fix_round_violations_numba(
     worklist_roots = np.empty(max_worklist, dtype=np.int32)
     worklist_count = 0
     
+    # Step 3a: Parallel detection of violating components
+    # Note: We call the parallel function from the wrapper, not here
+    # because njit functions can't call parallel functions directly.
+    # For now, use sequential detection inside njit.
     for r in range(n_points):
         if parent[r] == r:
             has_viol = _check_component_has_violation_numba(
@@ -1067,13 +1634,12 @@ def _parallel_constrained_boruvka_mst_sequential_numba(
 # Parallel Borůvka MST - CPU Backend
 # ==============================================================================
 
-@numba.njit(cache=True)
-def _parallel_constrained_boruvka_mst_cpu_numba(
+def _parallel_constrained_boruvka_mst_cpu(
     adj_indptr: np.ndarray, adj_neighbors: np.ndarray, adj_weights: np.ndarray, adj_edge_ids: np.ndarray,
     cannot_link_indptr: np.ndarray, cannot_link_indices: np.ndarray,
     n_points: int, n_edges: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """CPU parallel constrained Borůvka (Step 1a parallel, rest sequential)."""
+    """CPU parallel constrained Borůvka (Step 1a parallel, Step 3a parallel, rest sequential)."""
     parent = np.empty(n_points, dtype=np.int32)
     size = np.empty(n_points, dtype=np.int32)
     head = np.empty(n_points, dtype=np.int32)
@@ -1120,12 +1686,27 @@ def _parallel_constrained_boruvka_mst_cpu_numba(
         if n_added - n_added_before == 0:
             break
         
+        # Step 3a: Parallel detection of violating components
+        has_violation = _detect_violating_components_parallel(
+            parent, head, next_node, cannot_link_indptr, cannot_link_indices, n_points
+        )
+        
+        # Build worklist from parallel detection results
+        initial_worklist = np.empty(n_points, dtype=np.int32)
+        initial_worklist_count = 0
+        for r in range(n_points):
+            if has_violation[r]:
+                initial_worklist[initial_worklist_count] = r
+                initial_worklist_count += 1
+        
+        # Step 3b: Sequential correction
         parent, size, head, tail, next_node, n_added, cannot_link_edge_out, n_cannot_link_edges = \
-            _fix_round_violations_numba(
+            _fix_round_violations_with_initial_worklist_numba(
                 parent, size, head, tail, next_node,
                 round_edges_u, round_edges_v, round_edges_w, round_count,
                 mst_edges, n_added, cannot_link_indptr, cannot_link_indices,
                 cannot_link_edge_out, n_cannot_link_edges, n_points,
+                initial_worklist, initial_worklist_count,
             )
         
         if n_added >= n_points - 1:
@@ -1171,7 +1752,7 @@ def _parallel_constrained_boruvka_mst(
         backend = "cpu"
     
     if backend == "cpu":
-        return _parallel_constrained_boruvka_mst_cpu_numba(
+        return _parallel_constrained_boruvka_mst_cpu(
             adj_indptr, adj_neighbors, adj_weights, adj_edge_ids,
             cannot_link_indptr, cannot_link_indices, n_points, n_edges,
         )
