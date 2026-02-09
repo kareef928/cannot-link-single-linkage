@@ -1,9 +1,13 @@
 """
-Constrained Borůvka MST Algorithm
-=================================
+Constrained Borůvka MST Algorithm (NAIVE MODE)
+==============================================
 
 A minimal, readable implementation of Borůvka's algorithm for computing
 Minimum Spanning Trees with cannot-link constraints.
+
+**NAIVE MODE**: This version intentionally skips re-verification during
+Step 2 (merging) to demonstrate race conditions. Violations that slip
+through are caught and fixed by Step 3 (_fix_violations).
 
 This module provides a self-contained implementation that can be used
 for constrained HDBSCAN clustering where certain points must never
@@ -14,9 +18,14 @@ Algorithm Overview
 Borůvka's algorithm builds an MST by repeatedly finding the cheapest
 edge leaving each connected component, then merging components.
 
-With cannot-link constraints, we add two modifications:
-1. During edge selection: skip edges that would violate constraints
-2. After merging: verify no violations exist, fix by removing heaviest edge
+With cannot-link constraints, we add modifications:
+1. During edge selection (Step 1): skip edges that would violate constraints
+2. During merging (Step 2): NAIVE - no re-verification (allows race conditions!)
+3. After merging (Step 3): detect and fix violations by removing heaviest edge
+
+The naive approach in Step 2 means that multiple components selecting edges
+concurrently may end up creating violations when merged sequentially.
+Step 3 is essential to correct these violations.
 
 Example Usage
 -------------
@@ -569,12 +578,16 @@ def _boruvka_merge_components(
         else:
             root_small, root_large = target_root, r
         
-        # Re-verify constraints (may have changed due to other merges)
-        if check_merge_violates_constraints(
-            root_small, root_large, parent, head, next_node,
-            cl_indptr, cl_indices
-        ):
-            continue
+        # NAIVE MODE: Skip re-verification to demonstrate race conditions!
+        # This intentionally allows violations to slip through.
+        # Step 3 (_fix_violations) will catch and fix them.
+        #
+        # In a proper implementation, we would re-verify here:
+        # if check_merge_violates_constraints(
+        #     root_small, root_large, parent, head, next_node,
+        #     cl_indptr, cl_indices
+        # ):
+        #     continue
         
         # Perform union: smaller joins larger
         # Use deterministic tie-breaking (smaller index wins)
